@@ -58,6 +58,7 @@ from redis.exceptions import (
     CrossSlotTransactionError,
     DataError,
     MovedError,
+    NoScriptError,
     NoPermissionError,
     RedisClusterException,
     RedisClusterUnreachableError,
@@ -4810,6 +4811,379 @@ def test_evalsha_zero_keys_pipeline_execute_skips_get_command_keys():
         r.close()
 
 
+class CountingConnection:
+    """
+    A fake connection that records every command written to it and serves
+    responses from a programmed queue, so a test can count exactly how many
+    times each command (INCR, EVALSHA, SCRIPT LOAD, ...) reached a node.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.sent = []
+        self.host = default_host
+        self.port = default_port
+        self.db = 0
+
+    def send_command(self, *args, **kwargs):
+        self.sent.append(tuple(args))
+
+    def pack_commands(self, commands):
+        self.sent.extend(tuple(c) for c in commands)
+        return b""
+
+    def send_packed_command(self, *args, **kwargs):
+        pass
+
+    def read_response(self, *args, **kwargs):
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def disconnect(self, *args, **kwargs):
+        pass
+
+    def count(self, command):
+        return sum(1 for args in self.sent if args and args[0] == command)
+
+
+def set_counting_connection(rc, port, responses):
+    """Attach a CountingConnection to the node bound to ``port``."""
+    node = rc.get_node(host=default_host, port=port)
+    connection = CountingConnection(responses)
+    node.redis_connection.connection = connection
+    return connection
+
+
+def register_incrby_command(rc):
+    """
+    Teach the mocked commands parser about INCRBY, so routing a pipelined
+    INCR resolves its key locally instead of asking a (fake) server.
+    """
+    rc.commands_parser.commands["incrby"] = {
+        "name": "incrby",
+        "arity": 3,
+        "flags": ["write", "denyoom", "fast"],
+        "first_key_pos": 1,
+        "last_key_pos": 1,
+        "step_count": 1,
+    }
+
+
+@pytest.mark.onlycluster
+def test_pipeline_loads_registered_scripts_per_target_node():
+    """
+    Registered scripts are pre-loaded only onto the node that will execute
+    them; scripts on different slots share one non-transactional pipeline
+    and the responses keep the queued order.
+    """
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        register_incrby_command(r)
+        script_foo = r.register_script("return redis.call('GET', KEYS[1])")
+        script_bar = r.register_script("return redis.call('SET', KEYS[1], ARGV[1])")
+        assert key_slot(b"foo") != key_slot(b"bar")
+
+        # foo -> slot 12182 (node 7001), bar -> slot 5061 (node 7000)
+        conn_7000 = set_counting_connection(r, 7000, [[0], script_bar.sha, "barres"])
+        conn_7001 = set_counting_connection(r, 7001, [[0], script_foo.sha, 1, "foores"])
+
+        with r.pipeline() as pipe:
+            pipe.incr("foo")
+            script_foo(keys=["foo"], client=pipe)
+            script_bar(keys=["bar"], client=pipe)
+            assert pipe.execute() == [1, "foores", "barres"]
+
+        # Each script was checked and loaded only on the node owning its
+        # key's slot.
+        assert conn_7001.sent == [
+            ("SCRIPT EXISTS", script_foo.sha),
+            ("SCRIPT LOAD", script_foo.script),
+            ("INCRBY", "foo", 1),
+            ("EVALSHA", script_foo.sha, 1, "foo"),
+        ]
+        assert conn_7000.sent == [
+            ("SCRIPT EXISTS", script_bar.sha),
+            ("SCRIPT LOAD", script_bar.script),
+            ("EVALSHA", script_bar.sha, 1, "bar"),
+        ]
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_noscript_recovery_resends_only_the_failed_script():
+    """
+    A node that lost its script cache answers NOSCRIPT; recovery reloads the
+    script and resends only the failed EVALSHA - the INCR that already
+    succeeded in the same batch must not be replayed.
+    """
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        register_incrby_command(r)
+        script = r.register_script("return redis.call('GET', KEYS[1])")
+        conn = set_counting_connection(
+            r,
+            7001,
+            [
+                [1],  # SCRIPT EXISTS: already loaded
+                1,  # INCR
+                NoScriptError("NOSCRIPT No matching script. Please use EVAL."),
+                script.sha,  # SCRIPT LOAD (recovery)
+                "script_result",  # EVALSHA (recovery)
+            ],
+        )
+
+        with r.pipeline() as pipe:
+            pipe.incr("foo")
+            script(keys=["foo"], client=pipe)
+            assert pipe.execute() == [1, "script_result"]
+
+        assert conn.count("INCRBY") == 1
+        assert conn.count("EVALSHA") == 2
+        assert conn.count("SCRIPT LOAD") == 1
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_noscript_recovery_after_moved():
+    """
+    MOVED lands the retried EVALSHA on the new slot owner, which has never
+    seen the script; recovery loads it there and resends only that command.
+    """
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        register_incrby_command(r)
+        script = r.register_script("return redis.call('GET', KEYS[1])")
+        slot = key_slot(b"foo")
+        conn_7000 = set_counting_connection(
+            r,
+            7000,
+            [
+                NoScriptError("NOSCRIPT No matching script. Please use EVAL."),
+                script.sha,  # SCRIPT LOAD (recovery, on the new owner)
+                "script_result",  # EVALSHA (recovery)
+            ],
+        )
+        conn_7001 = set_counting_connection(
+            r,
+            7001,
+            [
+                [1],  # SCRIPT EXISTS
+                1,  # INCR
+                MovedError(f"{slot} {default_host}:7000"),  # EVALSHA -> MOVED
+                # The redirect retry re-resolves from the still-stale slots
+                # cache, hits the old owner once more, and only then follows
+                # the MOVED to the new owner.
+                MovedError(f"{slot} {default_host}:7000"),
+            ],
+        )
+
+        with r.pipeline() as pipe:
+            pipe.incr("foo")
+            script(keys=["foo"], client=pipe)
+            assert pipe.execute() == [1, "script_result"]
+
+        # The script was loaded onto the new owner only.
+        assert conn_7000.count("SCRIPT LOAD") == 1
+        assert conn_7001.count("SCRIPT LOAD") == 0
+        # The successful INCR was never replayed.
+        assert conn_7001.count("INCRBY") == 1
+        assert conn_7000.count("INCRBY") == 0
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_noscript_recovery_after_ask():
+    """
+    ASK lands the retried EVALSHA on the importing node, which has never
+    seen the script; recovery loads it onto the importing node and resends
+    with ASKING, without replaying the commands that already succeeded.
+    """
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        register_incrby_command(r)
+        script = r.register_script("return redis.call('GET', KEYS[1])")
+        slot = key_slot(b"foo")
+        conn_7000 = set_counting_connection(
+            r,
+            7000,
+            [
+                "OK",  # ASKING (redirect retry)
+                NoScriptError("NOSCRIPT No matching script. Please use EVAL."),
+                script.sha,  # SCRIPT LOAD (recovery, on the importing node)
+                "OK",  # ASKING (recovery)
+                "script_result",  # EVALSHA (recovery)
+            ],
+        )
+        conn_7001 = set_counting_connection(
+            r,
+            7001,
+            [
+                [1],  # SCRIPT EXISTS
+                1,  # INCR
+                AskError(f"{slot} {default_host}:7000"),  # EVALSHA -> ASK
+                # The redirect retry re-resolves from the slots cache (ASK
+                # does not move the slot) and is redirected once more.
+                AskError(f"{slot} {default_host}:7000"),
+                script.sha,  # SCRIPT LOAD (recovery first tries the owner)
+                AskError(f"{slot} {default_host}:7000"),  # still migrating
+            ],
+        )
+
+        with r.pipeline() as pipe:
+            pipe.incr("foo")
+            script(keys=["foo"], client=pipe)
+            assert pipe.execute() == [1, "script_result"]
+
+        # The script was loaded onto the importing node (after a first
+        # attempt on the slot owner, which is still migrating).
+        assert conn_7000.count("SCRIPT LOAD") == 1
+        assert conn_7001.count("SCRIPT LOAD") == 1
+        # ASKING preceded the EVALSHA on the importing node.
+        assert conn_7000.count("ASKING") == 2
+        # The successful INCR was never replayed.
+        assert conn_7001.count("INCRBY") == 1
+        assert conn_7000.count("INCRBY") == 0
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_cross_slot_script_rejected_before_sending():
+    """A single script whose keys span slots is rejected before any send."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 1")
+        conns = [
+            set_counting_connection(r, port, []) for port in (7000, 7001, 7002, 7003)
+        ]
+
+        with r.pipeline() as pipe:
+            script(keys=["foo", "bar"], client=pipe)
+            with pytest.raises(RedisClusterException, match="same key slot"):
+                pipe.execute()
+
+        for conn in conns:
+            assert conn.sent == []
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_zero_key_script_uses_default_node():
+    """
+    A zero-key script can run on any node; the pipeline pins it to the
+    default node so the script is loaded exactly where it will execute.
+    """
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        default_node = r.get_default_node()
+        default_conn = set_counting_connection(
+            r, default_node.port, [[0], script.sha, 42]
+        )
+        other_conns = [
+            set_counting_connection(r, node.port, [])
+            for node in r.get_nodes()
+            if node.port != default_node.port
+        ]
+
+        with r.pipeline() as pipe:
+            script(client=pipe)
+            assert pipe.execute() == [42]
+
+        assert default_conn.sent == [
+            ("SCRIPT EXISTS", script.sha),
+            ("SCRIPT LOAD", script.script),
+            ("EVALSHA", script.sha, 0),
+        ]
+        for conn in other_conns:
+            assert conn.sent == []
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_script_error_lands_at_its_position():
+    """A failing script's error stays at its own position in the response."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        register_incrby_command(r)
+        script = r.register_script("return redis.call('GET', KEYS[1])")
+        conn = set_counting_connection(
+            r,
+            7001,
+            [
+                [1],  # SCRIPT EXISTS
+                1,  # INCR
+                ResponseError("ERR Error running script"),  # EVALSHA
+                2,  # INCR
+            ],
+        )
+
+        with r.pipeline() as pipe:
+            pipe.incr("foo")
+            script(keys=["foo"], client=pipe)
+            pipe.incr("foo")
+            response = pipe.execute(raise_on_error=False)
+
+        assert response[0] == 1
+        assert isinstance(response[1], ResponseError)
+        assert not isinstance(response[1], NoScriptError)
+        assert response[2] == 2
+        # A plain script error is not a NOSCRIPT: nothing was re-sent.
+        assert conn.count("EVALSHA") == 1
+        assert conn.count("INCRBY") == 2
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_script_error_raises_with_position():
+    """raise_on_error=True raises the script error with its command number."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        register_incrby_command(r)
+        script = r.register_script("return redis.call('GET', KEYS[1])")
+        set_counting_connection(
+            r, 7001, [[1], 1, ResponseError("ERR Error running script"), 2]
+        )
+
+        with r.pipeline() as pipe:
+            pipe.incr("foo")
+            script(keys=["foo"], client=pipe)
+            pipe.incr("foo")
+            with pytest.raises(ResponseError, match="Command # 2"):
+                pipe.execute()
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_pipeline_raw_evalsha_noscript_is_not_recovered():
+    """NOSCRIPT for an unregistered EVALSHA cannot be recovered (unknown body)."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        sha = "a" * 40
+        conn = set_counting_connection(
+            r, 7001, [NoScriptError("NOSCRIPT No matching script. Please use EVAL.")]
+        )
+
+        with r.pipeline() as pipe:
+            pipe.evalsha(sha, 1, "foo")
+            response = pipe.execute(raise_on_error=False)
+
+        assert isinstance(response[0], NoScriptError)
+        # No SCRIPT EXISTS/LOAD was attempted: the body is unknown.
+        assert conn.sent == [("EVALSHA", sha, 1, "foo")]
+    finally:
+        r.close()
+
+
 @pytest.mark.onlycluster
 def test_evalsha_zero_keys_reuses_slot_in_transaction():
     """
@@ -4919,9 +5293,6 @@ class TestClusterPipeline:
         They maybe implemented in the future.
         """
         pipe = r.pipeline()
-
-        with pytest.raises(RedisClusterException):
-            pipe.load_scripts()
 
         with pytest.raises(RedisClusterException):
             pipe.script_load_for_pipeline(None)

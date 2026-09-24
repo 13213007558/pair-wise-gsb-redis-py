@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from redis.asyncio.keyspace_notifications import (
         AsyncClusterKeyspaceNotifications,
     )
+    from redis.commands.core import AsyncScript
 
 from redis._defaults import (
     DEFAULT_RETRY_BASE,
@@ -121,6 +122,7 @@ from redis.exceptions import (
     InvalidPipelineStack,
     MaxConnectionsError,
     MovedError,
+    NoScriptError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -2767,6 +2769,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         "cluster_client",
         "_transaction",
         "_execution_strategy",
+        "scripts",
     )
 
     # Type discrimination marker for @overload self-type pattern
@@ -2777,6 +2780,10 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
     ) -> None:
         self.cluster_client = client
         self._transaction = transaction
+        # Scripts registered through ``AsyncScript(client=pipe)`` calls,
+        # pre-loaded onto the executing node(s) by load_scripts() before the
+        # batch is sent.
+        self.scripts: Set["AsyncScript"] = set()
         self._execution_strategy: ExecutionStrategy = (
             PipelineStrategy(self)
             if not self._transaction
@@ -2893,6 +2900,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         Reset back to empty pipeline.
         """
         await self._execution_strategy.reset()
+        self.scripts.clear()
 
     def multi(self):
         """
@@ -2915,6 +2923,10 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
 
     async def unlink(self, *names):
         await self._execution_strategy.unlink(*names)
+
+    async def load_scripts(self):
+        """Load registered scripts onto the nodes that will execute them."""
+        await self._execution_strategy.load_scripts()
 
     def mset_nonatomic(
         self, mapping: Mapping[AnyKeyT, EncodableT]
@@ -2943,6 +2955,7 @@ class PipelineCommand:
         self.kwargs = kwargs
         self.position = position
         self.result: Union[Any, Exception] = None
+        self.node = None
         # Either record type: a policy resolver serves ``CommandPolicies``, while the
         # fallbacks below reuse the shared ``CommandMetadata`` defaults. Only the two routing
         # policies, which both carry, are ever read.
@@ -3004,6 +3017,15 @@ class ExecutionStrategy(ABC):
         Resets current execution strategy.
 
         See: ClusterPipeline.reset()
+        """
+        pass
+
+    @abstractmethod
+    async def load_scripts(self):
+        """
+        Load registered scripts onto the nodes that will execute them.
+
+        See: ClusterPipeline.load_scripts()
         """
         pass
 
@@ -3082,6 +3104,10 @@ class AbstractStrategy(ExecutionStrategy):
         )
         exception.args = (msg,) + exception.args[1:]
 
+    async def load_scripts(self):
+        """ """
+        raise RedisClusterException("method load_scripts() is not implemented")
+
     @abstractmethod
     def mset_nonatomic(
         self, mapping: Mapping[AnyKeyT, EncodableT]
@@ -3153,6 +3179,8 @@ class PipelineStrategy(AbstractStrategy):
                 try:
                     if self._pipe.cluster_client._initialize:
                         await self._pipe.cluster_client.initialize()
+                    if self._pipe.scripts:
+                        await self.load_scripts()
                     return await self._execute(
                         self._pipe.cluster_client,
                         self._command_queue,
@@ -3194,7 +3222,10 @@ class PipelineStrategy(AbstractStrategy):
                 *cmd.args, target_nodes_specified=target_nodes_specified
             )
 
-            if target_nodes_specified:
+            if cmd.node is not None:
+                # Pinned by load_scripts(): the node the script was loaded on.
+                target_nodes = [cmd.node]
+            elif target_nodes_specified:
                 target_nodes = client._parse_target_nodes(passed_targets)
             else:
                 target_nodes = await client._determine_nodes(
@@ -3255,6 +3286,15 @@ class PipelineStrategy(AbstractStrategy):
                         except Exception as e:
                             cmd.result = e
 
+            # A NOSCRIPT reply means the executing node lost the script: its
+            # script cache was flushed, or a MOVED/ASK redirect landed the
+            # EVALSHA on a node that never had it. Recover each failed script
+            # individually - only the failed command is re-sent, never the
+            # whole batch, so commands that already succeeded are not replayed.
+            for cmd in todo:
+                if isinstance(cmd.result, NoScriptError):
+                    cmd.result = await self._recover_noscript(client, cmd)
+
             if raise_on_error:
                 for cmd in todo:
                     result = cmd.result
@@ -3288,6 +3328,127 @@ class PipelineStrategy(AbstractStrategy):
                             break
 
         return [cmd.result for cmd in stack]
+
+    async def load_scripts(self) -> None:
+        """
+        Load every registered script onto the node(s) that will execute it.
+
+        The target node of each queued EVALSHA is derived from the keys the
+        script declared, so a script is loaded only onto a node that actually
+        runs it, and scripts hashing to different slots can share one
+        non-transactional pipeline.
+        """
+        scripts_by_sha = {s.sha: s for s in self._pipe.scripts}
+        client = self._pipe.cluster_client
+        # node name -> (node, [shas the queued EVALSHAs need on that node])
+        shas_by_node: Dict[str, Tuple["ClusterNode", List[str]]] = {}
+        for cmd in self._command_queue:
+            if cmd.args[0].upper() != "EVALSHA" or "target_nodes" in cmd.kwargs:
+                continue
+            script = scripts_by_sha.get(cmd.args[1])
+            if script is None:
+                continue
+            node = await self._script_target_node(client, cmd.args)
+            # Pin the execution target so the batch routes the command to the
+            # node the script is loaded on. This matters for zero-key scripts,
+            # which _determine_slot() would otherwise scatter to a random slot.
+            cmd.node = node
+            entry = shas_by_node.setdefault(node.name, (node, []))
+            if script.sha not in entry[1]:
+                entry[1].append(script.sha)
+
+        for node, shas in shas_by_node.values():
+            exists = await node.execute_command("SCRIPT EXISTS", *shas)
+            for sha, exist in zip(shas, exists):
+                if not exist:
+                    script = scripts_by_sha[sha]
+                    script.sha = await node.execute_command(
+                        "SCRIPT LOAD", script.script
+                    )
+
+    async def _script_target_node(
+        self, client: "RedisCluster", args: Tuple
+    ) -> "ClusterNode":
+        """
+        The node a queued EVALSHA will be routed to: the primary of the slot
+        its declared keys hash to. A cross-slot script is rejected here,
+        before anything is sent. A zero-key script can run on any node, so it
+        is pinned to the default node - the explicit target-node policy for
+        keyless scripts - to keep the load target and the execution target
+        the same.
+        """
+        if int(args[2]) > 0:
+            slot = await client._determine_slot(*args)
+            return client.nodes_manager.get_node_from_slot(slot, False)
+        default_node = client.get_default_node()
+        if default_node is None:
+            raise RedisClusterException(
+                "Cannot route a zero-key EVALSHA without a default node; "
+                "the cluster client is closed or not initialized yet."
+            )
+        return default_node
+
+    async def _recover_noscript(
+        self, client: "RedisCluster", cmd: "PipelineCommand"
+    ) -> Any:
+        """
+        Recover a single NOSCRIPT-failed EVALSHA: reload the script onto the
+        node that will execute it and resend just that command, following
+        MOVED/ASK redirects and loading the script onto each redirect target
+        before resending. Only the failed command is re-sent - commands that
+        already succeeded are never replayed, so their side effects (INCR and
+        the like) are not applied twice. Returns the command's new result.
+        """
+        script = None
+        for s in self._pipe.scripts:
+            if s.sha == cmd.args[1]:
+                script = s
+                break
+        if script is None:
+            # Raw EVALSHA without a registered script: the body is unknown,
+            # so the NOSCRIPT cannot be recovered here.
+            return cmd.result
+
+        redirect_node = None
+        attempts = 3
+        while attempts > 0:
+            attempts -= 1
+            try:
+                node = redirect_node or await self._script_target_node(client, cmd.args)
+                script.sha = await node.execute_command("SCRIPT LOAD", script.script)
+                if redirect_node is None:
+                    return await node.execute_command(
+                        "EVALSHA", script.sha, *cmd.args[2:], **cmd.kwargs
+                    )
+                connection = node.acquire_connection()
+                try:
+                    await node.disconnect_if_needed(connection)
+                    # ASK redirect: the ASKING allowance must sit on the same
+                    # connection, immediately before the command.
+                    await connection.send_command("ASKING")
+                    await node.parse_response(connection, "ASKING")
+                    await connection.send_command("EVALSHA", script.sha, *cmd.args[2:])
+                    return await node.parse_response(
+                        connection, "EVALSHA", **cmd.kwargs
+                    )
+                finally:
+                    try:
+                        await node.disconnect_if_needed(connection)
+                    finally:
+                        node.release(connection)
+            except MovedError as e:
+                # The slot moved mid-recovery; re-resolve its new owner.
+                await client.nodes_manager.move_slot(e)
+                redirect_node = None
+            except AskError as e:
+                # Temporary migration: load onto the importing node and
+                # resend with ASKING.
+                redirect_node = client.get_node(node_name=get_node_name(e.host, e.port))
+                if redirect_node is None:
+                    return e
+            except (RedisError, RedisClusterException) as e:
+                return e
+        return cmd.result
 
     async def reset(self):
         """

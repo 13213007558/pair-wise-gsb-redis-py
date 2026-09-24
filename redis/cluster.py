@@ -30,6 +30,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from redis.commands.core import Script
     from redis.keyspace_notifications import ClusterKeyspaceNotifications
 
 from redis import _himport_exec
@@ -80,6 +81,7 @@ from redis.exceptions import (
     InvalidPipelineStack,
     MaxConnectionsError,
     MovedError,
+    NoScriptError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -4499,6 +4501,9 @@ class ClusterPipeline(RedisCluster):
         """ """
         self.command_stack = []
         self.nodes_manager = nodes_manager
+        # Scripts registered through ``Script(client=pipe)`` calls, pre-loaded
+        # onto the executing node(s) by load_scripts() before the batch is sent.
+        self.scripts: Set["Script"] = set()
         # Share the parent cluster's HIMPORT registry (held on the NodesManager and
         # referenced by every node pool). The inherited himport_prepare/discard/
         # discard_all mutate this one object, so a fieldset declared on the pipeline is
@@ -4656,6 +4661,7 @@ class ClusterPipeline(RedisCluster):
         Reset back to empty pipeline.
         """
         self._execution_strategy.reset()
+        self.scripts.clear()
 
     def send_cluster_commands(
         self, stack, raise_on_error=True, allow_redirections=True
@@ -5135,9 +5141,139 @@ class PipelineStrategy(AbstractStrategy):
             return []
 
         try:
+            if self._pipe.scripts:
+                self.load_scripts()
             return self.send_cluster_commands(stack, raise_on_error)
         finally:
             self.reset()
+
+    def load_scripts(self):
+        """
+        Load every registered script onto the node(s) that will execute it.
+
+        The target node of each queued EVALSHA is derived from the keys the
+        script declared, so a script is loaded only onto a node that actually
+        runs it, and scripts hashing to different slots can share one
+        non-transactional pipeline.
+        """
+        scripts_by_sha = {s.sha: s for s in self._pipe.scripts}
+        # node name -> (node, [shas the queued EVALSHAs need on that node])
+        shas_by_node: Dict[str, Tuple["ClusterNode", List[str]]] = {}
+        for c in self._command_queue:
+            if c.args[0].upper() != "EVALSHA" or "target_nodes" in c.options:
+                continue
+            script = scripts_by_sha.get(c.args[1])
+            if script is None:
+                continue
+            node = self._script_target_node(c.args)
+            # Pin the execution target so the batch routes the command to the
+            # node the script is loaded on. This matters for zero-key scripts,
+            # which determine_slot() would otherwise scatter to a random slot.
+            c.node = node
+            entry = shas_by_node.setdefault(node.name, (node, []))
+            if script.sha not in entry[1]:
+                entry[1].append(script.sha)
+
+        for node, shas in shas_by_node.values():
+            redis_node = self._pipe.get_redis_connection(node)
+            exists = self._send_immediate_command(redis_node, "SCRIPT EXISTS", *shas)
+            for sha, exist in zip(shas, exists):
+                if not exist:
+                    script = scripts_by_sha[sha]
+                    script.sha = self._send_immediate_command(
+                        redis_node, "SCRIPT LOAD", script.script
+                    )
+
+    def _script_target_node(self, args) -> "ClusterNode":
+        """
+        The node a queued EVALSHA will be routed to: the primary of the slot
+        its declared keys hash to. A cross-slot script is rejected here,
+        before anything is sent. A zero-key script can run on any node, so it
+        is pinned to the default node - the explicit target-node policy for
+        keyless scripts - to keep the load target and the execution target
+        the same.
+        """
+        if int(args[2]) > 0:
+            slot = self._pipe.determine_slot(*args)
+            return self._nodes_manager.get_node_from_slot(slot, False)
+        default_node = self._pipe.get_default_node()
+        if default_node is None:
+            raise RedisClusterException(
+                "Cannot route a zero-key EVALSHA without a default node; "
+                "the cluster client is closed or not initialized yet."
+            )
+        return default_node
+
+    def _send_immediate_command(self, redis_node, *args, **options):
+        """
+        Run a command directly against one node, outside the batched write.
+        Mirrors how the main client borrows a single node connection.
+        """
+        connection = get_connection(redis_node)
+        try:
+            connection.send_command(*args)
+            return redis_node.parse_response(connection, args[0], **options)
+        finally:
+            redis_node.connection_pool.release(connection)
+
+    def _recover_noscript(self, c: "PipelineCommand"):
+        """
+        Recover a single NOSCRIPT-failed EVALSHA: reload the script onto the
+        node that will execute it and resend just that command, following
+        MOVED/ASK redirects and loading the script onto each redirect target
+        before resending. Only the failed command is re-sent - commands that
+        already succeeded are never replayed, so their side effects (INCR and
+        the like) are not applied twice. Returns the command's new result.
+        """
+        script = None
+        for s in self._pipe.scripts:
+            if s.sha == c.args[1]:
+                script = s
+                break
+        if script is None:
+            # Raw EVALSHA without a registered script: the body is unknown,
+            # so the NOSCRIPT cannot be recovered here.
+            return c.result
+
+        redirect_node = None
+        attempts = 3
+        while attempts > 0:
+            attempts -= 1
+            try:
+                node = redirect_node or self._script_target_node(c.args)
+                redis_node = self._pipe.get_redis_connection(node)
+                script.sha = self._send_immediate_command(
+                    redis_node, "SCRIPT LOAD", script.script
+                )
+                if redirect_node is None:
+                    return self._send_immediate_command(
+                        redis_node, "EVALSHA", script.sha, *c.args[2:], **c.options
+                    )
+                connection = get_connection(redis_node)
+                try:
+                    # ASK redirect: the ASKING allowance must sit on the same
+                    # connection, immediately before the command.
+                    connection.send_command("ASKING")
+                    redis_node.parse_response(connection, "ASKING")
+                    connection.send_command("EVALSHA", script.sha, *c.args[2:])
+                    return redis_node.parse_response(connection, "EVALSHA", **c.options)
+                finally:
+                    redis_node.connection_pool.release(connection)
+            except MovedError as e:
+                # The slot moved mid-recovery; re-resolve its new owner.
+                self._nodes_manager.move_slot(e)
+                redirect_node = None
+            except AskError as e:
+                # Temporary migration: load onto the importing node and
+                # resend with ASKING.
+                redirect_node = self._pipe.get_node(
+                    node_name=get_node_name(e.host, e.port)
+                )
+                if redirect_node is None:
+                    return e
+            except (RedisError, RedisClusterException) as e:
+                return e
+        return c.result
 
     def reset(self):
         """
@@ -5219,7 +5355,16 @@ class PipelineStrategy(AbstractStrategy):
                 # (it might be possible we have a cached node that no longer
                 # exists in the cluster, which is why we do this in a loop)
                 passed_targets = c.options.pop("target_nodes", None)
-                if passed_targets and not self._is_nodes_flag(passed_targets):
+                if c.node is not None:
+                    # The script loader pinned the node it loaded the script
+                    # on; route the command there rather than resolving
+                    # afresh (a zero-key EVALSHA would otherwise scatter to
+                    # a random slot).
+                    target_nodes = [c.node]
+
+                    if not command_policies:
+                        command_policies = _DEFAULT_KEYED_METADATA
+                elif passed_targets and not self._is_nodes_flag(passed_targets):
                     target_nodes = self._parse_target_nodes(passed_targets)
 
                     if not command_policies:
@@ -5416,6 +5561,15 @@ class PipelineStrategy(AbstractStrategy):
                     c.result = self._pipe.parent_execute_command(*c.args, **c.options)
                 except RedisError as e:
                     c.result = e
+
+        # A NOSCRIPT reply means the executing node lost the script: its
+        # script cache was flushed, or a MOVED/ASK redirect landed the
+        # EVALSHA on a node that never had it. Recover each failed script
+        # individually - only the failed command is re-sent, never the whole
+        # batch, so commands that already succeeded are not replayed.
+        for c in sorted(stack, key=lambda x: x.position):
+            if isinstance(c.result, NoScriptError):
+                c.result = self._recover_noscript(c)
 
         # turn the response back into a simple flat array that corresponds
         # to the sequence of commands issued in the stack in pipeline.execute()

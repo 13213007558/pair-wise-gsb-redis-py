@@ -10982,8 +10982,10 @@ class Script:
             # Make sure the pipeline can register the script before executing.
             client.scripts.add(self)
         if isinstance(client, ClusterPipeline):
-            # ClusterPipeline does not support script_load. Queue EVALSHA and
-            # leave NOSCRIPT recovery to the caller (same as AsyncScript).
+            # Register the script so the pipeline loads it onto the node(s)
+            # that will execute it before sending, and can recover from
+            # NOSCRIPT by reloading just this script.
+            client.scripts.add(self)
             return client.evalsha(self.sha, len(keys), *args)
         try:
             return client.evalsha(self.sha, len(keys), *args)
@@ -11064,6 +11066,10 @@ class AsyncScript:
         if isinstance(client, ClusterPipeline):
             # ClusterPipeline.evalsha queues synchronously. Awaiting the
             # pipeline would call initialize() and drop the queued command.
+            # Register the script so the pipeline loads it onto the node(s)
+            # that will execute it before sending, and can recover from
+            # NOSCRIPT by reloading just this script.
+            client.scripts.add(self)
             return client.evalsha(self.sha, len(keys), *args)
         try:
             return await client.evalsha(self.sha, len(keys), *args)
