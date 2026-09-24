@@ -72,6 +72,35 @@ NO_SUCH_FIELDSET_ERROR = {
 logger = logging.getLogger(__name__)
 
 
+class AttributedResponse:
+    """A RESP3 reply together with the metadata of its attribute frame(s).
+
+    The RESP3 attribute frame is not a reply of its own: it carries
+    metadata for the reply that follows it. The RESP3 parsers return this
+    wrapper only when the caller opts in with "with_attributes=True";
+    "value" holds the actual reply (which may itself contain nested
+    AttributedResponse items for attribute frames inside aggregates)
+    and "attributes" holds the merged attribute map that preceded it.
+    """
+
+    __slots__ = ("value", "attributes")
+
+    def __init__(self, value, attributes):
+        self.value = value
+        self.attributes = attributes
+
+    def __eq__(self, other):
+        if not isinstance(other, AttributedResponse):
+            return NotImplemented
+        return self.value == other.value and self.attributes == other.attributes
+
+    def __repr__(self):
+        return (
+            f"AttributedResponse(value={self.value!r}, "
+            f"attributes={self.attributes!r})"
+        )
+
+
 class BaseParser(ABC):
     EXCEPTION_CLASSES = {
         "ERR": {

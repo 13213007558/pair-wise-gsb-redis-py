@@ -242,7 +242,15 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
         disable_decoding=False,
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
+        with_attributes: bool = False,
     ):
+        if with_attributes:
+            # hiredis does not surface RESP3 attribute frames, so the
+            # pure-Python RESP3 parser is the only way to read them.
+            raise RedisError(
+                "Reading RESP3 reply attributes is not supported by the"
+                " hiredis parser; use the pure-Python RESP3 parser instead"
+            )
         # Bind the reader locally so a concurrent disconnect that clears
         # self._reader can't turn a later .gets() into an AttributeError;
         # re-checking the attribute each time would still race.
@@ -369,8 +377,18 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
         return True
 
     async def read_response(
-        self, disable_decoding: bool = False, push_request: bool = False
+        self,
+        disable_decoding: bool = False,
+        push_request: bool = False,
+        with_attributes: bool = False,
     ) -> Union[EncodableT, List[EncodableT]]:
+        if with_attributes:
+            # hiredis does not surface RESP3 attribute frames, so the
+            # pure-Python RESP3 parser is the only way to read them.
+            raise RedisError(
+                "Reading RESP3 reply attributes is not supported by the"
+                " hiredis parser; use the pure-Python RESP3 parser instead"
+            )
         # If `on_disconnect()` has been called, prohibit any more reads
         # even if they could happen because data might be present.
         # We still allow reads in progress to finish

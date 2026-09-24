@@ -6,6 +6,7 @@ from ..typing import EncodableT
 from ..utils import SENTINEL
 from .base import (
     AsyncPushNotificationsParser,
+    AttributedResponse,
     PushNotificationsParser,
     _AsyncRESPBase,
     _RESPBase,
@@ -34,6 +35,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         disable_decoding=False,
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
+        with_attributes: bool = False,
     ):
         pos = self._buffer.get_pos() if self._buffer is not None else None
         try:
@@ -41,6 +43,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                 disable_decoding=disable_decoding,
                 push_request=push_request,
                 timeout=timeout,
+                with_attributes=with_attributes,
             )
         except BaseException:
             if self._buffer is not None:
@@ -54,6 +57,10 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                     # Buffer may have been set to None by another thread after
                     # the check above; result is still valid so we don't raise
                     pass
+            if with_attributes and not isinstance(result, AttributedResponse):
+                # The caller opted in to attributes, so the top-level reply is
+                # always wrapped, even when no attribute frame preceded it.
+                result = AttributedResponse(result, {})
             return result
 
     def _read_response(
@@ -61,6 +68,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         disable_decoding=False,
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
+        with_attributes: bool = False,
     ):
         raw = self._buffer.readline(timeout=timeout)
         if not raw:
@@ -107,7 +115,11 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         # array response
         elif byte == b"*":
             response = [
-                self._read_response(disable_decoding=disable_decoding, timeout=timeout)
+                self._read_response(
+                    disable_decoding=disable_decoding,
+                    timeout=timeout,
+                    with_attributes=with_attributes,
+                )
                 for _ in range(int(response))
             ]
         # set response
@@ -115,7 +127,11 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
             # redis can return unhashable types (like dict) in a set,
             # so we return sets as list, all the time, for predictability
             response = [
-                self._read_response(disable_decoding=disable_decoding, timeout=timeout)
+                self._read_response(
+                    disable_decoding=disable_decoding,
+                    timeout=timeout,
+                    with_attributes=with_attributes,
+                )
                 for _ in range(int(response))
             ]
         # map response
@@ -132,8 +148,38 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                     disable_decoding=disable_decoding,
                     push_request=push_request,
                     timeout=timeout,
+                    with_attributes=with_attributes,
                 )
             response = resp_dict
+        # attribute response
+        elif byte == b"|":
+            # not a reply of its own: the map carries metadata for the reply
+            # that follows it, which may itself be preceded by more attribute
+            # frames or interleaved push messages.
+            attributes = {}
+            for _ in range(int(response)):
+                key = self._read_response(
+                    disable_decoding=disable_decoding, timeout=timeout
+                )
+                attributes[key] = self._read_response(
+                    disable_decoding=disable_decoding, timeout=timeout
+                )
+            response = self._read_response(
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                timeout=timeout,
+                with_attributes=with_attributes,
+            )
+            if with_attributes:
+                if isinstance(response, AttributedResponse):
+                    # consecutive attribute frames: merge them, the frame
+                    # closer to the reply wins on conflicting keys
+                    response = AttributedResponse(
+                        response.value, {**attributes, **response.attributes}
+                    )
+                else:
+                    response = AttributedResponse(response, attributes)
+            return response
         # push response
         elif byte == b">":
             response = [
@@ -141,6 +187,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                     disable_decoding=disable_decoding,
                     push_request=push_request,
                     timeout=timeout,
+                    with_attributes=with_attributes,
                 )
                 for _ in range(int(response))
             ]
@@ -159,6 +206,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                 disable_decoding=disable_decoding,
                 push_request=push_request,
                 timeout=timeout,
+                with_attributes=with_attributes,
             )
         else:
             raise InvalidResponse(f"Protocol Error: {raw!r}")
@@ -181,7 +229,10 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         return response
 
     async def read_response(
-        self, disable_decoding: bool = False, push_request: bool = False
+        self,
+        disable_decoding: bool = False,
+        push_request: bool = False,
+        with_attributes: bool = False,
     ):
         if not self._connected:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -191,14 +242,23 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             self._chunks.clear()
         self._pos = 0
         response = await self._read_response(
-            disable_decoding=disable_decoding, push_request=push_request
+            disable_decoding=disable_decoding,
+            push_request=push_request,
+            with_attributes=with_attributes,
         )
         # Successfully parsing a response allows us to clear our parsing buffer
         self._clear()
+        if with_attributes and not isinstance(response, AttributedResponse):
+            # The caller opted in to attributes, so the top-level reply is
+            # always wrapped, even when no attribute frame preceded it.
+            response = AttributedResponse(response, {})
         return response
 
     async def _read_response(
-        self, disable_decoding: bool = False, push_request: bool = False
+        self,
+        disable_decoding: bool = False,
+        push_request: bool = False,
+        with_attributes: bool = False,
     ) -> Union[EncodableT, ResponseError, None]:
         if not self._stream or not self.encoder:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -249,7 +309,12 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         # array response
         elif byte == b"*":
             response = [
-                (await self._read_response(disable_decoding=disable_decoding))
+                (
+                    await self._read_response(
+                        disable_decoding=disable_decoding,
+                        with_attributes=with_attributes,
+                    )
+                )
                 for _ in range(int(response))
             ]
         # set response
@@ -257,7 +322,12 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             # redis can return unhashable types (like dict) in a set,
             # so we always convert to a list, to have predictable return types
             response = [
-                (await self._read_response(disable_decoding=disable_decoding))
+                (
+                    await self._read_response(
+                        disable_decoding=disable_decoding,
+                        with_attributes=with_attributes,
+                    )
+                )
                 for _ in range(int(response))
             ]
         # map response
@@ -269,15 +339,45 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             for _ in range(int(response)):
                 key = await self._read_response(disable_decoding=disable_decoding)
                 resp_dict[key] = await self._read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
+                    disable_decoding=disable_decoding,
+                    push_request=push_request,
+                    with_attributes=with_attributes,
                 )
             response = resp_dict
+        # attribute response
+        elif byte == b"|":
+            # not a reply of its own: the map carries metadata for the reply
+            # that follows it, which may itself be preceded by more attribute
+            # frames or interleaved push messages.
+            attributes = {}
+            for _ in range(int(response)):
+                key = await self._read_response(disable_decoding=disable_decoding)
+                attributes[key] = await self._read_response(
+                    disable_decoding=disable_decoding
+                )
+            response = await self._read_response(
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                with_attributes=with_attributes,
+            )
+            if with_attributes:
+                if isinstance(response, AttributedResponse):
+                    # consecutive attribute frames: merge them, the frame
+                    # closer to the reply wins on conflicting keys
+                    response = AttributedResponse(
+                        response.value, {**attributes, **response.attributes}
+                    )
+                else:
+                    response = AttributedResponse(response, attributes)
+            return response
         # push response
         elif byte == b">":
             response = [
                 (
                     await self._read_response(
-                        disable_decoding=disable_decoding, push_request=push_request
+                        disable_decoding=disable_decoding,
+                        push_request=push_request,
+                        with_attributes=with_attributes,
                     )
                 )
                 for _ in range(int(response))
@@ -285,7 +385,9 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             response = await self.handle_push_response(response)
             if not push_request:
                 return await self._read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
+                    disable_decoding=disable_decoding,
+                    push_request=push_request,
+                    with_attributes=with_attributes,
                 )
             else:
                 return response

@@ -285,6 +285,7 @@ class ConnectionInterface:
         timeout: Union[float, object] = SENTINEL,
         disconnect_on_error=True,
         push_request=False,
+        with_attributes=False,
     ):
         pass
 
@@ -474,6 +475,7 @@ class MaintNotificationsAbstractConnection:
         timeout: Union[float, object] = SENTINEL,
         disconnect_on_error=True,
         push_request=False,
+        with_attributes=False,
     ):
         pass
 
@@ -1514,8 +1516,16 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         timeout: Union[float, object] = SENTINEL,
         disconnect_on_error=True,
         push_request=False,
+        with_attributes=False,
     ):
-        """Read the response from a previously sent command"""
+        """Read the response from a previously sent command
+
+        When ``with_attributes`` is True (RESP3 only), the response is
+        returned as an ``AttributedResponse`` carrying the reply in
+        ``value`` and the metadata of any attribute frames that preceded
+        it in ``attributes``. In that mode a ``ResponseError`` reply is
+        returned inside the wrapper instead of being raised.
+        """
 
         host_error = self._host_error()
 
@@ -1525,6 +1535,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     disable_decoding=disable_decoding,
                     push_request=push_request,
                     timeout=timeout,
+                    with_attributes=with_attributes,
                 )
             else:
                 response = self._parser.read_response(

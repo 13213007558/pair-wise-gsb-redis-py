@@ -240,6 +240,7 @@ class AsyncMaintNotificationsAbstractConnection:
         *,
         disconnect_on_error: bool = True,
         push_request: bool | None = False,
+        with_attributes: bool = False,
     ) -> Any:
         pass
 
@@ -1349,8 +1350,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         *,
         disconnect_on_error: bool = True,
         push_request: bool | None = False,
+        with_attributes: bool = False,
     ):
         """Read the response from a previously sent command.
+
+        When ``with_attributes`` is True (RESP3 only), the response is
+        returned as an ``AttributedResponse`` carrying the reply in
+        ``value`` and the metadata of any attribute frames that preceded
+        it in ``attributes``. In that mode a ``ResponseError`` reply is
+        returned inside the wrapper instead of being raised.
 
         ``timeout`` semantics:
         - ``None`` (default): fall back to ``self.socket_timeout``.
@@ -1390,6 +1398,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                             response = await self._read_response_from_parser(
                                 disable_decoding=disable_decoding,
                                 push_request=push_request,
+                                with_attributes=with_attributes,
                             )
                         finally:
                             self._active_read_timeout = None
@@ -1398,11 +1407,13 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                         response = await self._read_response_from_parser(
                             disable_decoding=disable_decoding,
                             push_request=push_request,
+                            with_attributes=with_attributes,
                         )
             else:
                 response = await self._read_response_from_parser(
                     disable_decoding=disable_decoding,
                     push_request=push_request,
+                    with_attributes=with_attributes,
                 )
         except asyncio.TimeoutError as e:
             if timeout is not None:
@@ -1436,11 +1447,16 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         return response
 
     async def _read_response_from_parser(
-        self, disable_decoding: bool = False, push_request: bool | None = False
+        self,
+        disable_decoding: bool = False,
+        push_request: bool | None = False,
+        with_attributes: bool = False,
     ):
         if check_protocol_version(self.protocol, 3):
             return await self._parser.read_response(
-                disable_decoding=disable_decoding, push_request=push_request
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                with_attributes=with_attributes,
             )
         return await self._parser.read_response(disable_decoding=disable_decoding)
 

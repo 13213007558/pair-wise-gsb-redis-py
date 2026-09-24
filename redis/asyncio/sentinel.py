@@ -75,6 +75,7 @@ class SentinelManagedConnection(Connection):
         *,
         disconnect_on_error: Optional[float] = True,
         push_request: Optional[bool] = False,
+        with_attributes: bool = False,
     ):
         try:
             return await super().read_response(
@@ -82,6 +83,7 @@ class SentinelManagedConnection(Connection):
                 timeout=timeout,
                 disconnect_on_error=disconnect_on_error,
                 push_request=push_request,
+                with_attributes=with_attributes,
             )
         except ReadOnlyError:
             if self.connection_pool.is_master:
