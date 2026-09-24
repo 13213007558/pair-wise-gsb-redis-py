@@ -181,6 +181,21 @@ then each batch is sent separately to the slot’s owner.
    >>> rc.mget_nonatomic('foo', 'bar', 'zzz')
    [b'value1', b'value2', b'value3']
 
+For reads that need to span slots while still reporting what happened to each
+key, the cluster client provides ``mget_across_slots``. It groups the keys by
+slot, sends one MGET per group and returns one entry per input position; a
+missing key reports a ``None`` value and a failed group reports its error on
+the positions it covered. Groups are independent - a redirection or a node
+failure only re-reads the affected group, so the operation is not atomic.
+
+.. code:: python
+
+   >>> results = rc.mget_across_slots('foo', 'bar', 'zzz')
+   >>> [item.value for item in results]
+   [b'value1', b'value2', b'value3']
+   >>> results[0].error is None
+   True
+
 **Cluster PubSub:**
 
 When a ClusterPubSub instance is created without specifying a node, a

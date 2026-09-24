@@ -13,6 +13,7 @@ from typing import (
     List,
     Literal,
     Mapping,
+    NamedTuple,
     NoReturn,
     Sequence,
     overload,
@@ -183,6 +184,23 @@ READ_COMMANDS = frozenset(
 )
 
 
+class ClusterBatchGetResult(NamedTuple):
+    """
+    The outcome of a single key position in
+    :meth:`ClusterMultiKeyCommands.mget_across_slots` (and its async
+    counterpart), returned in the same position as the key was passed in.
+
+    ``error`` is ``None`` when the slot group the key belongs to was read
+    successfully; ``value`` then holds the key's value, or ``None`` when the
+    key does not exist. When the read of the key's slot group failed,
+    ``error`` holds the exception that made the group fail and ``value`` is
+    ``None``.
+    """
+
+    value: bytes | str | None
+    error: RedisError | None
+
+
 class ClusterMultiKeyCommands(ClusterCommandsProtocol):
     """
     A class containing commands that handle more than one key
@@ -286,6 +304,57 @@ class ClusterMultiKeyCommands(ClusterCommandsProtocol):
 
         # Reorder keys in the order the user provided & return
         return self._reorder_keys_by_command(keys, slots_to_keys, res)
+
+    def mget_across_slots(
+        self, keys: KeysT, *args: KeyT
+    ) -> List[ClusterBatchGetResult]:
+        """
+        Reads keys that are scattered over different slots by grouping them
+        per slot and sending one MGET per slot group, then restores the
+        results to the positions the keys were passed in at. Duplicated keys
+        are read and reported once per occurrence.
+
+        Returns a list of :class:`ClusterBatchGetResult` ordered identically
+        to ``keys``. Each entry either carries the key's value (``None`` when
+        the key does not exist) or, when the read of that key's slot group
+        failed, the error that made the group fail.
+
+        The operation is not atomic across slots: every slot group is read
+        with its own MGET, so a failure of one group - including MOVED/ASK
+        redirections and connection errors, which are retried following the
+        client's configured retry policy before being reported - neither
+        re-reads nor invalidates the groups that already succeeded.
+
+        For more information see https://redis.io/commands/mget
+        """
+        # Concatenate all keys into a list
+        keys = list_or_args(keys, args)
+        if not keys:
+            return []
+
+        # Group the input positions by slot. Duplicated keys keep one
+        # position each, so every occurrence is read and reported on its own.
+        slots_to_positions: Dict[int, List[int]] = {}
+        for position, key in enumerate(keys):
+            slot = key_slot(self.encoder.encode(key))
+            slots_to_positions.setdefault(slot, []).append(position)
+
+        results: Dict[int, ClusterBatchGetResult] = {}
+        for positions in slots_to_positions.values():
+            slot_keys = [keys[position] for position in positions]
+            try:
+                values = self.execute_command("MGET", *slot_keys)
+            except RedisError as error:
+                # The failure is scoped to this slot group: groups that
+                # already succeeded keep their results and are not read
+                # again.
+                for position in positions:
+                    results[position] = ClusterBatchGetResult(value=None, error=error)
+            else:
+                for position, value in zip(positions, values):
+                    results[position] = ClusterBatchGetResult(value=value, error=None)
+
+        return [results[position] for position in range(len(keys))]
 
     def mset_nonatomic(self, mapping: Mapping[AnyKeyT, EncodableT]) -> List[bool]:
         """
@@ -422,6 +491,57 @@ class AsyncClusterMultiKeyCommands(ClusterMultiKeyCommands):
 
         # Reorder keys in the order the user provided & return
         return self._reorder_keys_by_command(keys, slots_to_keys, res)
+
+    async def mget_across_slots(
+        self, keys: KeysT, *args: KeyT
+    ) -> List[ClusterBatchGetResult]:
+        """
+        Reads keys that are scattered over different slots by grouping them
+        per slot and sending one MGET per slot group, then restores the
+        results to the positions the keys were passed in at. Duplicated keys
+        are read and reported once per occurrence.
+
+        Returns a list of :class:`ClusterBatchGetResult` ordered identically
+        to ``keys``. Each entry either carries the key's value (``None`` when
+        the key does not exist) or, when the read of that key's slot group
+        failed, the error that made the group fail.
+
+        The operation is not atomic across slots: every slot group is read
+        with its own MGET, so a failure of one group - including MOVED/ASK
+        redirections and connection errors, which are retried following the
+        client's configured retry policy before being reported - neither
+        re-reads nor invalidates the groups that already succeeded.
+
+        For more information see https://redis.io/commands/mget
+        """
+        # Concatenate all keys into a list
+        keys = list_or_args(keys, args)
+        if not keys:
+            return []
+
+        # Group the input positions by slot. Duplicated keys keep one
+        # position each, so every occurrence is read and reported on its own.
+        slots_to_positions: Dict[int, List[int]] = {}
+        for position, key in enumerate(keys):
+            slot = key_slot(self.encoder.encode(key))
+            slots_to_positions.setdefault(slot, []).append(position)
+
+        results: Dict[int, ClusterBatchGetResult] = {}
+        for positions in slots_to_positions.values():
+            slot_keys = [keys[position] for position in positions]
+            try:
+                values = await self.execute_command("MGET", *slot_keys)
+            except RedisError as error:
+                # The failure is scoped to this slot group: groups that
+                # already succeeded keep their results and are not read
+                # again.
+                for position in positions:
+                    results[position] = ClusterBatchGetResult(value=None, error=error)
+            else:
+                for position, value in zip(positions, values):
+                    results[position] = ClusterBatchGetResult(value=value, error=None)
+
+        return [results[position] for position in range(len(keys))]
 
     async def mset_nonatomic(self, mapping: Mapping[AnyKeyT, EncodableT]) -> List[bool]:
         """
