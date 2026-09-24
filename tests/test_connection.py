@@ -1848,6 +1848,7 @@ class TestUnitCacheProxyConnection:
             timeout=0.5,
             disconnect_on_error=True,
             push_request=False,
+            return_attributes=False,
         )
 
     def test_read_response_timeout_default_is_sentinel(self, mock_connection):
@@ -1872,6 +1873,7 @@ class TestUnitCacheProxyConnection:
             timeout=SENTINEL,
             disconnect_on_error=True,
             push_request=False,
+            return_attributes=False,
         )
 
     def test_read_response_timeout_none_passed_through(self, mock_connection):
@@ -1896,6 +1898,7 @@ class TestUnitCacheProxyConnection:
             timeout=None,
             disconnect_on_error=True,
             push_request=False,
+            return_attributes=False,
         )
 
     def test_read_response_timeout_zero_passed_through(self, mock_connection):
@@ -1920,6 +1923,7 @@ class TestUnitCacheProxyConnection:
             timeout=0,
             disconnect_on_error=True,
             push_request=False,
+            return_attributes=False,
         )
 
     def test_read_response_all_params_with_timeout(self, mock_connection):
@@ -1949,6 +1953,7 @@ class TestUnitCacheProxyConnection:
             timeout=1.5,
             disconnect_on_error=False,
             push_request=True,
+            return_attributes=False,
         )
 
 

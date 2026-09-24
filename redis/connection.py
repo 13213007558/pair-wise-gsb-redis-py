@@ -43,7 +43,14 @@ from ._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
     get_default_socket_keepalive_options,
 )
-from ._parsers import BaseParser, Encoder, _HiredisParser, _RESP2Parser, _RESP3Parser
+from ._parsers import (
+    AttributedResponse,
+    BaseParser,
+    Encoder,
+    _HiredisParser,
+    _RESP2Parser,
+    _RESP3Parser,
+)
 from .auth.token import TokenInterface
 from .backoff import NoBackoff
 from .credentials import CredentialProvider, UsernamePasswordCredentialProvider
@@ -285,6 +292,7 @@ class ConnectionInterface:
         timeout: Union[float, object] = SENTINEL,
         disconnect_on_error=True,
         push_request=False,
+        return_attributes=False,
     ):
         pass
 
@@ -1514,8 +1522,16 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         timeout: Union[float, object] = SENTINEL,
         disconnect_on_error=True,
         push_request=False,
+        return_attributes=False,
     ):
-        """Read the response from a previously sent command"""
+        """Read the response from a previously sent command
+
+        When ``return_attributes`` is True, the result is an
+        ``AttributedResponse`` carrying the reply in ``value`` and any
+        RESP3 attribute metadata in ``attributes`` (None when the server
+        attached none). The default (False) consumes attribute frames and
+        returns the plain reply, preserving the existing return types.
+        """
 
         host_error = self._host_error()
 
@@ -1525,10 +1541,13 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     disable_decoding=disable_decoding,
                     push_request=push_request,
                     timeout=timeout,
+                    return_attributes=return_attributes,
                 )
             else:
                 response = self._parser.read_response(
-                    disable_decoding=disable_decoding, timeout=timeout
+                    disable_decoding=disable_decoding,
+                    timeout=timeout,
+                    return_attributes=return_attributes,
                 )
         except socket.timeout as e:
             if disconnect_on_error:
@@ -2004,6 +2023,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         timeout: Union[float, object] = SENTINEL,
         disconnect_on_error=True,
         push_request=False,
+        return_attributes=False,
     ):
         with self._cache_lock:
             # Check if command response exists in a cache and it's not in progress.
@@ -2023,6 +2043,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                     record_csc_network_saved(
                         bytes_saved=len(res) if hasattr(res, "__len__") else 0,
                     )
+                    if return_attributes:
+                        # a cached reply carries no attribute metadata
+                        return AttributedResponse(res, None)
                     return res
                 record_csc_request(
                     result=CSCResult.MISS,
@@ -2033,6 +2056,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             timeout=timeout,
             disconnect_on_error=disconnect_on_error,
             push_request=push_request,
+            return_attributes=return_attributes,
         )
 
         with self._cache_lock:
@@ -2050,7 +2074,14 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # and wasn't invalidated by another connection in meantime.
             if cache_entry is not None:
                 cache_entry.status = CacheEntryStatus.VALID
-                cache_entry.cache_value = response
+                # cache the bare reply, not the AttributedResponse wrapper a
+                # return_attributes read produces, so later default reads of
+                # the cached entry keep returning the plain value
+                cache_entry.cache_value = (
+                    response.value
+                    if isinstance(response, AttributedResponse)
+                    else response
+                )
                 self._cache.set(cache_entry)
 
             self._current_command_cache_key = None

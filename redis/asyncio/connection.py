@@ -240,6 +240,7 @@ class AsyncMaintNotificationsAbstractConnection:
         *,
         disconnect_on_error: bool = True,
         push_request: bool | None = False,
+        return_attributes: bool = False,
     ) -> Any:
         pass
 
@@ -1349,8 +1350,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         *,
         disconnect_on_error: bool = True,
         push_request: bool | None = False,
+        return_attributes: bool = False,
     ):
         """Read the response from a previously sent command.
+
+        When ``return_attributes`` is True, the result is an
+        ``AttributedResponse`` carrying the reply in ``value`` and any
+        RESP3 attribute metadata in ``attributes`` (None when the server
+        attached none). The default (False) consumes attribute frames and
+        returns the plain reply, preserving the existing return types.
 
         ``timeout`` semantics:
         - ``None`` (default): fall back to ``self.socket_timeout``.
@@ -1390,6 +1398,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                             response = await self._read_response_from_parser(
                                 disable_decoding=disable_decoding,
                                 push_request=push_request,
+                                return_attributes=return_attributes,
                             )
                         finally:
                             self._active_read_timeout = None
@@ -1398,11 +1407,13 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                         response = await self._read_response_from_parser(
                             disable_decoding=disable_decoding,
                             push_request=push_request,
+                            return_attributes=return_attributes,
                         )
             else:
                 response = await self._read_response_from_parser(
                     disable_decoding=disable_decoding,
                     push_request=push_request,
+                    return_attributes=return_attributes,
                 )
         except asyncio.TimeoutError as e:
             if timeout is not None:
@@ -1436,13 +1447,20 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         return response
 
     async def _read_response_from_parser(
-        self, disable_decoding: bool = False, push_request: bool | None = False
+        self,
+        disable_decoding: bool = False,
+        push_request: bool | None = False,
+        return_attributes: bool = False,
     ):
         if check_protocol_version(self.protocol, 3):
             return await self._parser.read_response(
-                disable_decoding=disable_decoding, push_request=push_request
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                return_attributes=return_attributes,
             )
-        return await self._parser.read_response(disable_decoding=disable_decoding)
+        return await self._parser.read_response(
+            disable_decoding=disable_decoding, return_attributes=return_attributes
+        )
 
     def pack_command(self, *args: EncodableT) -> List[bytes]:
         """Pack a series of arguments into the Redis protocol"""

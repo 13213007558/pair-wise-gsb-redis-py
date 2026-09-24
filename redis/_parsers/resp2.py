@@ -3,7 +3,7 @@ from typing import Any, Union
 from ..exceptions import ConnectionError, InvalidResponse, ResponseError
 from ..typing import EncodableT
 from ..utils import SENTINEL
-from .base import _AsyncRESPBase, _RESPBase
+from .base import AttributedResponse, _AsyncRESPBase, _RESPBase
 from .socket import SERVER_CLOSED_CONNECTION_ERROR
 
 
@@ -11,7 +11,10 @@ class _RESP2Parser(_RESPBase):
     """RESP2 protocol implementation"""
 
     def read_response(
-        self, disable_decoding=False, timeout: Union[float, object] = SENTINEL
+        self,
+        disable_decoding=False,
+        timeout: Union[float, object] = SENTINEL,
+        return_attributes=False,
     ):
         pos = self._buffer.get_pos() if self._buffer else None
         try:
@@ -24,6 +27,10 @@ class _RESP2Parser(_RESPBase):
             raise
         else:
             self._buffer.purge()
+            if return_attributes:
+                # RESP2 has no attribute frames; there is never any
+                # metadata to attach to the reply
+                result = AttributedResponse(result, None)
             return result
 
     def _read_response(
@@ -78,7 +85,9 @@ class _RESP2Parser(_RESPBase):
 class _AsyncRESP2Parser(_AsyncRESPBase):
     """Async class for the RESP2 protocol"""
 
-    async def read_response(self, disable_decoding: bool = False):
+    async def read_response(
+        self, disable_decoding: bool = False, return_attributes: bool = False
+    ):
         if not self._connected:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
         if self._chunks:
@@ -89,6 +98,10 @@ class _AsyncRESP2Parser(_AsyncRESPBase):
         response = await self._read_response(disable_decoding=disable_decoding)
         # Successfully parsing a response allows us to clear our parsing buffer
         self._clear()
+        if return_attributes:
+            # RESP2 has no attribute frames; there is never any
+            # metadata to attach to the reply
+            response = AttributedResponse(response, None)
         return response
 
     async def _read_response(
