@@ -83,8 +83,9 @@ class CommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
     COMMAND output is used to determine key locations.
     Commands that do not have a predefined key location are flagged with
-    'movablekeys', and these commands' keys are determined by the command
-    'COMMAND GETKEYS'.
+    'movablekeys'; their keys are interpreted locally from the key
+    specifications reported by 'COMMAND', and only specifications that are
+    missing or not fully interpretable fall back to 'COMMAND GETKEYS'.
     """
 
     def __init__(self, redis_connection):
@@ -102,9 +103,6 @@ class CommandsParser(AbstractCommandsParser):
             commands[cmd.lower()] = commands.pop(cmd)
         self.commands = commands
 
-    # As soon as this PR is merged into Redis, we should reimplement
-    # our logic to use COMMAND INFO changes to determine the key positions
-    # https://github.com/redis/redis/pull/8324
     def get_keys(self, redis_conn, *args):
         """
         Get the keys from the passed command.
@@ -140,7 +138,7 @@ class CommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = self._get_moveable_keys(redis_conn, *args)
+            keys = self._resolve_movable_keys(command, redis_conn, *args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -156,21 +154,47 @@ class CommandsParser(AbstractCommandsParser):
                         if str_if_bytes(subcmd[0]) == subcmd_name:
                             command = self.parse_subcommand(subcmd)
 
-                            if command["first_key_pos"] > 0:
+                            if (
+                                command["first_key_pos"] > 0
+                                or "movablekeys" in command["flags"]
+                            ):
                                 is_subcmd = True
 
                 # The command doesn't have keys in it
                 if not is_subcmd:
                     return None
-            last_key_pos = command["last_key_pos"]
-            if last_key_pos < 0:
-                last_key_pos = len(args) - abs(last_key_pos)
-            keys_pos = list(
-                range(command["first_key_pos"], last_key_pos + 1, command["step_count"])
-            )
-            keys = [args[pos] for pos in keys_pos]
+            if "movablekeys" in command["flags"]:
+                # A movablekeys subcommand: its keys move with the arguments,
+                # so the legacy positions cannot find them.
+                keys = self._resolve_movable_keys(command, redis_conn, *args)
+            else:
+                last_key_pos = command["last_key_pos"]
+                if last_key_pos < 0:
+                    last_key_pos = len(args) - abs(last_key_pos)
+                keys_pos = list(
+                    range(
+                        command["first_key_pos"],
+                        last_key_pos + 1,
+                        command["step_count"],
+                    )
+                )
+                keys = [args[pos] for pos in keys_pos]
 
         return keys
+
+    def _resolve_movable_keys(self, command, redis_conn, *args):
+        """
+        Keys of a 'movablekeys' command or subcommand.
+
+        Interpreted locally from the key specifications the server reported
+        with 'COMMAND'; only a command whose specifications are missing or not
+        fully interpretable (e.g. flagged 'incomplete') is resolved by the
+        server with 'COMMAND GETKEYS'.
+        """
+        keys = _interpret_key_specs(args, command.get("key_specifications"))
+        if keys is not None:
+            return [key for _, key in keys]
+        return self._get_moveable_keys(redis_conn, *args)
 
     def _get_moveable_keys(self, redis_conn, *args):
         """
@@ -255,8 +279,10 @@ class AsyncCommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
 
     COMMAND output is used to determine key locations.
-    Commands that do not have a predefined key location are flagged with 'movablekeys',
-    and these commands' keys are determined by the command 'COMMAND GETKEYS'.
+    Commands that do not have a predefined key location are flagged with
+    'movablekeys'; their keys are interpreted locally from the key
+    specifications reported by 'COMMAND', and only specifications that are
+    missing or not fully interpretable fall back to 'COMMAND GETKEYS'.
 
     NOTE: Due to a bug in redis<7.0, this does not work properly
     for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -278,9 +304,6 @@ class AsyncCommandsParser(AbstractCommandsParser):
         commands = await self.node.execute_command("COMMAND")
         self.commands = {cmd.lower(): command for cmd, command in commands.items()}
 
-    # As soon as this PR is merged into Redis, we should reimplement
-    # our logic to use COMMAND INFO changes to determine the key positions
-    # https://github.com/redis/redis/pull/8324
     async def get_keys(self, *args: Any) -> Optional[Tuple[str, ...]]:
         """
         Get the keys from the passed command.
@@ -316,7 +339,7 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = await self._get_moveable_keys(*args)
+            keys = await self._resolve_movable_keys(command, *args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -332,21 +355,49 @@ class AsyncCommandsParser(AbstractCommandsParser):
                         if str_if_bytes(subcmd[0]) == subcmd_name:
                             command = self.parse_subcommand(subcmd)
 
-                            if command["first_key_pos"] > 0:
+                            if (
+                                command["first_key_pos"] > 0
+                                or "movablekeys" in command["flags"]
+                            ):
                                 is_subcmd = True
 
                 # The command doesn't have keys in it
                 if not is_subcmd:
                     return None
-            last_key_pos = command["last_key_pos"]
-            if last_key_pos < 0:
-                last_key_pos = len(args) - abs(last_key_pos)
-            keys_pos = list(
-                range(command["first_key_pos"], last_key_pos + 1, command["step_count"])
-            )
-            keys = [args[pos] for pos in keys_pos]
+            if "movablekeys" in command["flags"]:
+                # A movablekeys subcommand: its keys move with the arguments,
+                # so the legacy positions cannot find them.
+                keys = await self._resolve_movable_keys(command, *args)
+            else:
+                last_key_pos = command["last_key_pos"]
+                if last_key_pos < 0:
+                    last_key_pos = len(args) - abs(last_key_pos)
+                keys_pos = list(
+                    range(
+                        command["first_key_pos"],
+                        last_key_pos + 1,
+                        command["step_count"],
+                    )
+                )
+                keys = [args[pos] for pos in keys_pos]
 
         return keys
+
+    async def _resolve_movable_keys(
+        self, command: Dict[str, Any], *args: Any
+    ) -> Optional[List[Any]]:
+        """
+        Keys of a 'movablekeys' command or subcommand.
+
+        Interpreted locally from the key specifications the server reported
+        with 'COMMAND'; only a command whose specifications are missing or not
+        fully interpretable (e.g. flagged 'incomplete') is resolved by the
+        server with 'COMMAND GETKEYS'.
+        """
+        keys = _interpret_key_specs(args, command.get("key_specifications"))
+        if keys is not None:
+            return [key for _, key in keys]
+        return await self._get_moveable_keys(*args)
 
     async def _get_moveable_keys(self, *args: Any) -> Optional[Tuple[str, ...]]:
         try:
@@ -436,6 +487,173 @@ def _parse_subcommand(command: Any) -> Dict[str, Any]:
         cmd_dict["key_specifications"] = command[8]
         cmd_dict["subcommands"] = command[9]
     return cmd_dict
+
+
+def _key_spec_section_to_dict(section: Any) -> Dict[str, Any]:
+    """
+    Normalize a key specification - or one of its nested ``begin_search`` /
+    ``find_keys`` sections - into a string-keyed dict.
+
+    RESP3 reports these structures as maps and RESP2 as flat
+    ``[name, value, ...]`` sequences, so both shapes are read here. Values are
+    kept as reported; only the field names are decoded.
+    """
+    if isinstance(section, dict):
+        return {str_if_bytes(name): value for name, value in section.items()}
+    normalized = {}
+    if isinstance(section, (list, tuple)):
+        for index in range(0, len(section) - 1, 2):
+            normalized[str_if_bytes(section[index])] = section[index + 1]
+    return normalized
+
+
+def _resolve_begin_search(
+    begin_search: Dict[str, Any], args: Tuple[Any, ...], argc: int
+) -> Optional[int]:
+    """
+    The 1-based position the keys of one key specification start at, or None
+    when the specification's ``begin_search`` cannot be resolved locally.
+    """
+    if "index" in begin_search:
+        pos = _key_spec_section_to_dict(begin_search["index"]).get("pos")
+        if not isinstance(pos, int) or isinstance(pos, bool) or pos < 1:
+            return None
+        first = pos
+    elif "keyword" in begin_search:
+        keyword_spec = _key_spec_section_to_dict(begin_search["keyword"])
+        keyword = keyword_spec.get("keyword")
+        startfrom = keyword_spec.get("startfrom")
+        if (
+            keyword is None
+            or not isinstance(startfrom, int)
+            or isinstance(startfrom, bool)
+        ):
+            return None
+        keyword = str_if_bytes(keyword).upper()
+        index = startfrom if startfrom >= 0 else argc + startfrom
+        first = None
+        while 0 <= index < argc:
+            arg = args[index]
+            if isinstance(arg, (bytes, str)) and str_if_bytes(arg).upper() == keyword:
+                first = index + 1
+                break
+            index += 1
+        if first is None:
+            # The keyword is absent (e.g. MIGRATE without KEYS): the
+            # specifications do not say where this invocation's keys are.
+            return None
+    else:
+        return None
+    if first >= argc:
+        # No argument is left to carry a key; the invocation is malformed and
+        # only the server can say so.
+        return None
+    return first
+
+
+def _resolve_find_keys(
+    find_keys: Dict[str, Any], args: Tuple[Any, ...], argc: int, first: int
+) -> Optional[List[int]]:
+    """
+    The key positions one key specification covers, given the position its
+    ``begin_search`` resolved to, or None when the specification's
+    ``find_keys`` cannot be resolved locally.
+    """
+    if "range" in find_keys:
+        range_spec = _key_spec_section_to_dict(find_keys["range"])
+        lastkey = range_spec.get("lastkey")
+        step = range_spec.get("keystep")
+        limit = range_spec.get("limit")
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (lastkey, step, limit)
+        ):
+            return None
+        if step <= 0:
+            return None
+        if lastkey >= 0:
+            last = first + lastkey
+        elif limit:
+            # ``limit`` divides the arguments from ``first`` on, and only the
+            # first share carries keys - XREAD's streams before their IDs.
+            last = first + (argc - first) // limit - 1
+        else:
+            last = argc + lastkey
+        if last >= argc:
+            return None
+        return list(range(first, last + 1, step))
+    if "keynum" in find_keys:
+        keynum_spec = _key_spec_section_to_dict(find_keys["keynum"])
+        keynumidx = keynum_spec.get("keynumidx")
+        firstkey = keynum_spec.get("firstkey")
+        step = keynum_spec.get("keystep")
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (keynumidx, firstkey, step)
+        ):
+            return None
+        if keynumidx < 0 or firstkey < 0 or step <= 0:
+            return None
+        numkeys_pos = first + keynumidx
+        if numkeys_pos >= argc:
+            return None
+        try:
+            numkeys = int(args[numkeys_pos])
+        except (TypeError, ValueError):
+            return None
+        if numkeys < 0:
+            return None
+        positions = [first + firstkey + offset * step for offset in range(numkeys)]
+        if positions and positions[-1] >= argc:
+            return None
+        return positions
+    return None
+
+
+def _interpret_key_specs(
+    args: Tuple[Any, ...], key_specs: Any
+) -> Optional[List[Tuple[int, Any]]]:
+    """
+    Resolve the keys of a command invocation from the key specifications of
+    its ``COMMAND`` entry, without asking the server.
+
+    Returns ``(position, key)`` pairs in specification order - the position
+    each key was found at and its raw value, bytes or str as passed. Returns
+    None when the specifications are missing, of an unknown shape, or not
+    fully interpretable locally (a specification flagged ``incomplete``, a
+    keyword that is absent, an unknown ``begin_search``/``find_keys`` type);
+    the caller then falls back to ``COMMAND GETKEYS``. An empty list is a
+    complete answer: the invocation carries no keys (every specification is
+    ``not_key``, or a ``keynum`` specification counts zero keys).
+    """
+    if not key_specs:
+        return None
+    keys = []
+    argc = len(args)
+    for key_spec in key_specs:
+        spec = _key_spec_section_to_dict(key_spec)
+        flags = {str_if_bytes(flag) for flag in spec.get("flags") or ()}
+        if "not_key" in flags:
+            # The arguments this specification covers are not key names (a
+            # shard pubsub channel, a search index), so it adds no keys.
+            continue
+        if "incomplete" in flags:
+            # The specification does not cover every key the command may
+            # take, so a local answer could miss keys. Let the server
+            # resolve them.
+            return None
+        first = _resolve_begin_search(
+            _key_spec_section_to_dict(spec.get("begin_search")), args, argc
+        )
+        if first is None:
+            return None
+        positions = _resolve_find_keys(
+            _key_spec_section_to_dict(spec.get("find_keys")), args, argc, first
+        )
+        if positions is None:
+            return None
+        keys.extend((position, args[position]) for position in positions)
+    return keys
 
 
 def _is_keyless_command(
