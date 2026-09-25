@@ -187,3 +187,167 @@ def get_expected_command_policies(changes_in_defaults={}):
     }
     default_cmd_policies.update(changes_in_defaults)
     return default_cmd_policies
+
+
+def key_spec(flags, begin_search, find_keys):
+    """A single key specification, in the RESP3 (map) shape of a `COMMAND` reply."""
+    return {"flags": flags, "begin_search": begin_search, "find_keys": find_keys}
+
+
+def begin_index(pos):
+    return {"type": "index", "spec": {"pos": pos}}
+
+
+def begin_keyword(keyword, startfrom):
+    return {"type": "keyword", "spec": {"keyword": keyword, "startfrom": startfrom}}
+
+
+def find_range(lastkey, keystep=1, limit=0):
+    return {
+        "type": "range",
+        "spec": {"lastkey": lastkey, "keystep": keystep, "limit": limit},
+    }
+
+
+def find_keynum(keynumidx=0, firstkey=1, keystep=1):
+    return {
+        "type": "keynum",
+        "spec": {"keynumidx": keynumidx, "firstkey": firstkey, "keystep": keystep},
+    }
+
+
+def movablekeys_command_entry(key_specifications, subcommands=None):
+    """
+    A parsed `COMMAND` reply entry for a `movablekeys` command: the legacy key
+    positions are zeroed, so the keys are only discoverable through the specs.
+    """
+    return {
+        "name": "",
+        "arity": -2,
+        "flags": ["readonly", "movablekeys"],
+        "first_key_pos": 0,
+        "last_key_pos": 0,
+        "step_count": 0,
+        "tips": [],
+        "key_specifications": key_specifications,
+        "subcommands": subcommands or [],
+    }
+
+
+def movablekeys_commands_table():
+    """
+    A synthetic parsed `COMMAND` reply of `movablekeys` commands, in the RESP3
+    (map) key-spec shape, for exercising local key-spec interpretation without a
+    server. Both command parser test suites build their parsers from this one
+    table, so the sync and async interpretations are compared over identical
+    metadata.
+    """
+    return {
+        # XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]: the keys
+        # after STREAMS are half of the remaining arguments (limit 2).
+        "xread": movablekeys_command_entry(
+            [
+                key_spec(
+                    ["RO", "access"],
+                    begin_keyword("STREAMS", -1),
+                    find_range(-1, limit=2),
+                )
+            ]
+        ),
+        # ZUNION numkeys key [key ...] ...: the key count is read off the invocation.
+        "zunion": movablekeys_command_entry(
+            [key_spec(["RO", "access"], begin_index(1), find_keynum())]
+        ),
+        # ZUNIONSTORE destination numkeys key [key ...] ...: two specs, one for the
+        # destination and one for the source sets.
+        "zunionstore": movablekeys_command_entry(
+            [
+                key_spec(["RW", "insert"], begin_index(1), find_range(0)),
+                key_spec(["RO", "access"], begin_index(2), find_keynum()),
+            ]
+        ),
+        # GEORADIUS key ... [STORE key] [STOREDIST key]: two optional keyword
+        # specs, found by scanning forward from the first argument.
+        "georadius": movablekeys_command_entry(
+            [
+                key_spec(["RO", "access"], begin_index(1), find_range(0)),
+                key_spec(["RW", "insert"], begin_keyword("STORE", 1), find_range(0)),
+                key_spec(
+                    ["RW", "insert"], begin_keyword("STOREDIST", 1), find_range(0)
+                ),
+            ]
+        ),
+        # EVAL script numkeys key [key ...] arg [arg ...]
+        "eval": movablekeys_command_entry(
+            [key_spec(["RW", "access"], begin_index(2), find_keynum())]
+        ),
+        # A container module command with movablekeys subcommands.
+        "module.cmd": {
+            "name": "module.cmd",
+            "arity": -2,
+            "flags": ["container"],
+            "first_key_pos": 0,
+            "last_key_pos": 0,
+            "step_count": 0,
+            "tips": [],
+            "key_specifications": [],
+            "subcommands": [
+                [
+                    "module.cmd|sub",
+                    -3,
+                    ["readonly", "movablekeys"],
+                    0,
+                    0,
+                    0,
+                    [],
+                    [],
+                    [key_spec(["RO", "access"], begin_index(2), find_range(-1))],
+                    [],
+                ],
+                [
+                    "module.cmd|partial",
+                    -3,
+                    ["readonly", "movablekeys"],
+                    0,
+                    0,
+                    0,
+                    [],
+                    [],
+                    [
+                        key_spec(
+                            ["RO", "access", "incomplete"],
+                            begin_index(2),
+                            find_range(-1),
+                        )
+                    ],
+                    [],
+                ],
+            ],
+        },
+        # A command whose only spec describes an argument that is not a key name.
+        "shard.pub": movablekeys_command_entry(
+            [key_spec(["RO", "not_key"], begin_index(1), find_range(-1))]
+        ),
+        # Specs that cannot be interpreted locally in full: each of these must be
+        # resolved by COMMAND GETKEYS instead.
+        "incomplete.cmd": movablekeys_command_entry(
+            [key_spec(["RW", "access", "incomplete"], begin_index(1), find_range(-1))]
+        ),
+        "varflags.cmd": movablekeys_command_entry(
+            [
+                key_spec(
+                    ["RW", "access", "variable_flags"], begin_index(1), find_range(-1)
+                )
+            ]
+        ),
+        "unknownbegin.cmd": movablekeys_command_entry(
+            [key_spec(["RO"], {"type": "unknown", "spec": {}}, find_range(-1))]
+        ),
+        "unknownfind.cmd": movablekeys_command_entry(
+            [key_spec(["RO"], begin_index(1), {"type": "unknown", "spec": {}})]
+        ),
+        # A range with a step: keys and values alternate.
+        "keystep.cmd": movablekeys_command_entry(
+            [key_spec(["RO"], begin_index(1), find_range(-1, keystep=2))]
+        ),
+    }
