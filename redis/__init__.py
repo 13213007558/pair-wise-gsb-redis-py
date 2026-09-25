@@ -27,6 +27,7 @@ from redis.keyspace_notifications import (
     SubkeyspaceitemChannel,
     get_channel_type,
 )
+from redis.geo_polygon import GeoPolygon
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
@@ -85,6 +86,7 @@ __all__ = [
     "DataError",
     "DriverInfo",
     "EventType",
+    "GeoPolygon",
     "from_url",
     "default_backoff",
     "InvalidPipelineStack",

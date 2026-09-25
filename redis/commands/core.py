@@ -37,6 +37,11 @@ from redis.asyncio.observability.recorder import (
     record_streaming_lag_from_response as async_record_streaming_lag,
 )
 from redis.exceptions import ConnectionError, DataError, NoScriptError, RedisError
+from redis.geo_polygon import (
+    GeoPolygon,
+    filter_geosearch_response,
+    prepare_polygon_search,
+)
 from redis.himport import (
     HIMPORT_DISCARD,
     HIMPORT_DISCARDALL,
@@ -12134,8 +12139,183 @@ class GeoCommands(CommandsProtocol):
 
         return self.execute_command(command, *pieces, **kwargs)
 
+    def geosearch_polygon(
+        self,
+        name: KeyT,
+        outer: Sequence[Sequence[float]] | GeoPolygon,
+        holes: Sequence[Sequence[Sequence[float]]] | None = None,
+        unit: str = "m",
+        sort: str | None = None,
+        count: int | None = None,
+        withcoord: bool = False,
+        withdist: bool = False,
+        withhash: bool = False,
+    ) -> GeoSearchResponse:
+        """
+        Perform a GEOSEARCH query restricted to a polygonal area.
 
-AsyncGeoCommands = GeoCommands
+        Redis itself only supports circular and rectangular GEOSEARCH
+        shapes. This helper first narrows the search on the server side
+        to the circle bounding the polygon, then filters the returned
+        candidates client side against the exact polygon geometry.
+
+        ``outer`` is the polygon outer ring: a sequence of at least three
+        ``(longitude, latitude)`` pairs. A ``GeoPolygon`` instance may be
+        passed instead, in which case ``holes`` must be None.
+
+        ``holes`` is an optional sequence of rings, each in the same
+        format as ``outer``, describing areas excluded from the result.
+        Rings may cross the antimeridian (+-180 longitude). Points lying
+        exactly on a ring boundary - of the outer ring or of any hole -
+        are consistently treated as inside the polygon. Self-intersecting
+        rings and invalid coordinates (latitude outside [-90, 90],
+        longitude outside [-180, 180], non-finite values) are rejected
+        with ``DataError`` before any command is sent to the server.
+
+        ``unit``, ``sort``, ``count``, ``withcoord``, ``withdist`` and
+        ``withhash`` behave exactly like the matching ``geosearch``
+        arguments; distances and coordinates in the result are the values
+        returned by the server. When ``count`` is given, the server-side
+        COUNT is grown progressively until ``count`` polygon matches are
+        found or the bounding circle is exhausted, so members filtered
+        out by the polygon cannot starve the result: the returned nearest
+        ``count`` members are the nearest ones inside the polygon.
+        """
+        polygon, longitude, latitude, radius = prepare_polygon_search(
+            outer, holes, unit, count
+        )
+        if count is None:
+            response = self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                radius=radius,
+                unit=unit,
+                sort=sort,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            return filter_geosearch_response(
+                polygon, response, withcoord, withdist, withhash
+            )
+
+        matched: GeoSearchResponse = []
+        examined = 0
+        limit = count
+        while True:
+            response = self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                radius=radius,
+                unit=unit,
+                sort=sort,
+                count=limit,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            matched.extend(
+                filter_geosearch_response(
+                    polygon, response[examined:], withcoord, withdist, withhash
+                )
+            )
+            examined = len(response)
+            if len(matched) >= count or examined < limit:
+                break
+            limit *= 2
+        return matched[:count]
+
+
+class AsyncGeoCommands(GeoCommands):
+    async def geosearch_polygon(
+        self,
+        name: KeyT,
+        outer: Sequence[Sequence[float]] | GeoPolygon,
+        holes: Sequence[Sequence[Sequence[float]]] | None = None,
+        unit: str = "m",
+        sort: str | None = None,
+        count: int | None = None,
+        withcoord: bool = False,
+        withdist: bool = False,
+        withhash: bool = False,
+    ) -> GeoSearchResponse:
+        """
+        Perform a GEOSEARCH query restricted to a polygonal area.
+
+        Redis itself only supports circular and rectangular GEOSEARCH
+        shapes. This helper first narrows the search on the server side
+        to the circle bounding the polygon, then filters the returned
+        candidates client side against the exact polygon geometry.
+
+        ``outer`` is the polygon outer ring: a sequence of at least three
+        ``(longitude, latitude)`` pairs. A ``GeoPolygon`` instance may be
+        passed instead, in which case ``holes`` must be None.
+
+        ``holes`` is an optional sequence of rings, each in the same
+        format as ``outer``, describing areas excluded from the result.
+        Rings may cross the antimeridian (+-180 longitude). Points lying
+        exactly on a ring boundary - of the outer ring or of any hole -
+        are consistently treated as inside the polygon. Self-intersecting
+        rings and invalid coordinates (latitude outside [-90, 90],
+        longitude outside [-180, 180], non-finite values) are rejected
+        with ``DataError`` before any command is sent to the server.
+
+        ``unit``, ``sort``, ``count``, ``withcoord``, ``withdist`` and
+        ``withhash`` behave exactly like the matching ``geosearch``
+        arguments; distances and coordinates in the result are the values
+        returned by the server. When ``count`` is given, the server-side
+        COUNT is grown progressively until ``count`` polygon matches are
+        found or the bounding circle is exhausted, so members filtered
+        out by the polygon cannot starve the result: the returned nearest
+        ``count`` members are the nearest ones inside the polygon.
+        """
+        polygon, longitude, latitude, radius = prepare_polygon_search(
+            outer, holes, unit, count
+        )
+        if count is None:
+            response = await self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                radius=radius,
+                unit=unit,
+                sort=sort,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            return filter_geosearch_response(
+                polygon, response, withcoord, withdist, withhash
+            )
+
+        matched: GeoSearchResponse = []
+        examined = 0
+        limit = count
+        while True:
+            response = await self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                radius=radius,
+                unit=unit,
+                sort=sort,
+                count=limit,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            matched.extend(
+                filter_geosearch_response(
+                    polygon, response[examined:], withcoord, withdist, withhash
+                )
+            )
+            examined = len(response)
+            if len(matched) >= count or examined < limit:
+                break
+            limit *= 2
+        return matched[:count]
 
 
 class ModuleCommands(CommandsProtocol):
