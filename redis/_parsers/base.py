@@ -1,7 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
 from asyncio import IncompleteReadError, StreamReader
-from typing import Awaitable, Callable, List, Optional, Protocol, Union
+from typing import Any, Awaitable, Callable, List, Optional, Protocol, Union
 
 from redis.maint_notifications import (
     MaintenanceNotification,
@@ -70,6 +70,32 @@ NO_SUCH_FIELDSET_ERROR = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+class AttributedValue:
+    """A RESP3 reply value together with its response metadata (attributes).
+
+    Produced only when the connection is created with
+    ``expose_attributes=True``: every reply that the server preceded with one
+    or more RESP3 attribute frames (``|``) is returned wrapped in this type,
+    at the exact position the value holds in the reply structure. When the
+    option is off (the default), attribute frames are consumed and discarded
+    and replies keep their plain shape.
+    """
+
+    __slots__ = ("value", "attributes")
+
+    def __init__(self, value: Any, attributes: dict):
+        self.value = value
+        self.attributes = attributes
+
+    def __eq__(self, other):
+        if isinstance(other, AttributedValue):
+            return self.value == other.value and self.attributes == other.attributes
+        return NotImplemented
+
+    def __repr__(self):
+        return f"AttributedValue({self.value!r}, attributes={self.attributes!r})"
 
 
 class BaseParser(ABC):
@@ -338,7 +364,16 @@ class PushNotificationsParser(Protocol):
         """Handle pubsub push responses"""
         raise NotImplementedError()
 
-    def handle_push_response(self, response, **kwargs):
+    def handle_push_response(self, response, attributes=None, **kwargs):
+        """Handle a push message.
+
+        ``attributes`` holds the merged RESP3 attribute frames that preceded
+        the push message itself (None when it carried none). They belong to
+        the push message and are never attached to a regular command
+        response. Registered handler functions keep their single-argument
+        signature, so the attributes are not forwarded to them; override
+        this method to consume them.
+        """
         msg_type = response[0]
         if isinstance(msg_type, bytes):
             msg_type = msg_type.decode()
@@ -430,9 +465,16 @@ class AsyncPushNotificationsParser(Protocol):
         """Handle pubsub push responses asynchronously"""
         raise NotImplementedError()
 
-    async def handle_push_response(self, response, **kwargs):
-        """Handle push responses asynchronously"""
+    async def handle_push_response(self, response, attributes=None, **kwargs):
+        """Handle push responses asynchronously.
 
+        ``attributes`` holds the merged RESP3 attribute frames that preceded
+        the push message itself (None when it carried none). They belong to
+        the push message and are never attached to a regular command
+        response. Registered handler functions keep their single-argument
+        signature, so the attributes are not forwarded to them; override
+        this method to consume them.
+        """
         msg_type = response[0]
         if isinstance(msg_type, bytes):
             msg_type = msg_type.decode()

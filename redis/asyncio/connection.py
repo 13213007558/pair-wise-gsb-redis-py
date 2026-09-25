@@ -638,6 +638,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         credential_provider: CredentialProvider | None = None,
         protocol: int | None = None,
         legacy_responses: bool = True,
+        expose_attributes: bool = False,
         event_dispatcher: EventDispatcher | None = None,
         maint_notifications_config: MaintNotificationsConfig | None = None,
         maint_notifications_pool_handler: (
@@ -666,6 +667,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             **Deprecated.** Use driver_info instead. Library name for CLIENT SETINFO.
         lib_version : str, optional
             **Deprecated.** Use driver_info instead. Library version for CLIENT SETINFO.
+        expose_attributes : bool, optional
+            When True (requires protocol=3), RESP3 attribute frames sent by the
+            server are exposed: the reply they precede is returned wrapped in
+            ``AttributedValue`` (``.value`` / ``.attributes``). Default False:
+            attribute frames are consumed and discarded.
         """
         if (username or password) and credential_provider is not None:
             raise DataError(
@@ -736,6 +742,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 raise ConnectionError("protocol must be either 2 or 3")
         self.protocol = p
         self.legacy_responses = legacy_responses
+        self.expose_attributes = expose_attributes
+        if expose_attributes and self.protocol != 3:
+            raise RedisError(
+                "Exposing RESP3 attributes is only supported with RESP version 3"
+            )
         if parser_class != _AsyncHiredisParser:
             # The Python parsers are protocol-specific; hiredis supports both.
             if self.protocol == 3 and parser_class == _AsyncRESP2Parser:
@@ -828,6 +839,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         :param parser_class: The required parser class
         """
         self._parser = parser_class(socket_read_size=self._socket_read_size)
+        if self.expose_attributes:
+            if isinstance(self._parser, _AsyncRESP3Parser):
+                self._parser.expose_attributes = True
+            else:
+                raise RedisError(
+                    "Exposing RESP3 attributes requires the pure-Python RESP3 "
+                    "parser; the hiredis parser does not surface them. "
+                    "Pass parser_class=_AsyncRESP3Parser."
+                )
 
     def _get_parser(self) -> BaseParser:
         return self._parser

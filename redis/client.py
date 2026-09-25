@@ -332,6 +332,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         credential_provider: CredentialProvider | None = None,
         protocol: int | None = None,
         legacy_responses: bool = True,
+        expose_attributes: bool = False,
         cache: CacheInterface | None = None,
         cache_config: CacheConfig | None = None,
         event_dispatcher: EventDispatcher | None = None,
@@ -449,6 +450,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                 "credential_provider": credential_provider,
                 "protocol": protocol,
                 "legacy_responses": legacy_responses,
+                "expose_attributes": expose_attributes,
             }
             # based on input, setup appropriate connection args
             if unix_socket_path is not None:

@@ -1,4 +1,5 @@
 from redis import asyncio  # noqa
+from redis._parsers import AttributedValue
 from redis.backoff import default_backoff
 from redis.client import Redis, StrictRedis
 from redis.driver_info import DriverInfo
@@ -72,6 +73,7 @@ VERSION = tuple(map(int_or_str, __version__.split(".")))
 __all__ = [
     "AuthenticationError",
     "AuthenticationWrongNumberOfArgsError",
+    "AttributedValue",
     "BlockingConnectionPool",
     "BusyLoadingError",
     "ChannelType",

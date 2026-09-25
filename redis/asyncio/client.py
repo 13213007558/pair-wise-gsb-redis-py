@@ -345,6 +345,7 @@ class Redis(
         credential_provider: CredentialProvider | None = None,
         protocol: int | None = None,
         legacy_responses: bool = True,
+        expose_attributes: bool = False,
         event_dispatcher: EventDispatcher | None = None,
         maint_notifications_config: MaintNotificationsConfig | None = None,
     ):
@@ -440,6 +441,7 @@ class Redis(
                 "redis_connect_func": redis_connect_func,
                 "protocol": protocol,
                 "legacy_responses": legacy_responses,
+                "expose_attributes": expose_attributes,
             }
             # based on input, setup appropriate connection args
             if unix_socket_path is not None:

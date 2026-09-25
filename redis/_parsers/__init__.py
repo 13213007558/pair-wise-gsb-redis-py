@@ -1,5 +1,6 @@
 from .base import (
     AsyncPushNotificationsParser,
+    AttributedValue,
     BaseParser,
     PushNotificationsParser,
     _AsyncRESPBase,
@@ -12,6 +13,7 @@ from .resp3 import _AsyncRESP3Parser, _RESP3Parser
 
 __all__ = [
     "AsyncCommandsParser",
+    "AttributedValue",
     "_AsyncHiredisParser",
     "_AsyncRESPBase",
     "_AsyncRESP2Parser",
