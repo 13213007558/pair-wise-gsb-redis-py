@@ -2184,3 +2184,103 @@ def test_nrevrange_count_keeps_highest_timestamps(client):
     _assert_nrange_rows(res, [[0, [0.0]], [1, [1.0]]])
     res = client.ts().nrevrange(["{s}:a"], from_time="-", to_time="+", count=2)
     _assert_nrange_rows(res, [[4, [4.0]], [3, [3.0]]])
+
+
+@pytest.mark.redismod
+def test_resample_linear_matrix_and_mask(client):
+    # three series sharing one label set: labels are column metadata only,
+    # so identical labels must not merge columns
+    client.ts().create("resample:s1", labels={"grp": "resample"})
+    client.ts().create("resample:s2", labels={"grp": "resample"})
+    client.ts().create("resample:s3", labels={"grp": "resample"})
+    # s1: samples exactly on the interval endpoints
+    client.ts().add("resample:s1", 0, 1.0)
+    client.ts().add("resample:s1", 1000, 5.0)
+    # s2: a NaN sample and a gap after 250
+    client.ts().add("resample:s2", 0, float("nan"))
+    client.ts().add("resample:s2", 250, 2.0)
+    # s3: a single sample in the middle
+    client.ts().add("resample:s3", 500, 3.0)
+
+    result = client.ts().resample(
+        ["grp=resample"],
+        origin=0,
+        step=250,
+        start=0,
+        end=1000,
+        strategy="linear",
+        max_gap=500,
+        keys=["resample:s1", "resample:s2", "resample:s3"],
+    )
+    assert result["timestamps"] == [0, 250, 500, 750]
+    assert result["keys"] == ["resample:s1", "resample:s2", "resample:s3"]
+    assert result["labels"] == [{"grp": "resample"}] * 3
+    values = result["values"]
+    mask = result["mask"]
+    # s1: observed on the endpoint; linear needs both neighbors within
+    # max_gap, so 250/750 are missing (no extrapolation) and 500 interpolates
+    assert values[0][0] == 1.0
+    assert mask[0][0] == "observed"
+    assert values[1][0] is None
+    assert mask[1][0] == "missing"
+    assert values[2][0] == 3.0
+    assert mask[2][0] == "interpolated"
+    assert values[3][0] is None
+    assert mask[3][0] == "missing"
+    # s2: NaN is a real observation; the gap past 250 stays missing
+    assert math.isnan(values[0][1])
+    assert mask[0][1] == "observed"
+    assert values[1][1] == 2.0
+    assert mask[1][1] == "observed"
+    assert values[2][1] is None
+    assert values[3][1] is None
+    # s3: single sample is observed on its grid point only
+    assert values[2][2] == 3.0
+    assert [row[2] for row in mask] == ["missing", "missing", "observed", "missing"]
+
+    # without keys, columns follow the sorted discovered series order even
+    # though TS.MRANGE may return them unordered
+    discovered = client.ts().resample(
+        ["grp=resample"], origin=0, step=250, start=0, end=1000
+    )
+    assert discovered["keys"] == ["resample:s1", "resample:s2", "resample:s3"]
+
+
+@pytest.mark.redismod
+def test_resample_exact_and_previous(client):
+    client.ts().create("resample:p", labels={"grp": "resample-p"})
+    client.ts().add("resample:p", 100, 1.0)
+    client.ts().add("resample:p", 400, 2.0)
+
+    exact = client.ts().resample(
+        ["grp=resample-p"], origin=0, step=100, start=0, end=500, strategy="exact"
+    )
+    assert exact["timestamps"] == [0, 100, 200, 300, 400]
+    assert exact["values"] == [[None], [1.0], [None], [None], [2.0]]
+    assert exact["mask"] == [
+        ["missing"],
+        ["observed"],
+        ["missing"],
+        ["missing"],
+        ["observed"],
+    ]
+
+    previous = client.ts().resample(
+        ["grp=resample-p"],
+        origin=0,
+        step=100,
+        start=0,
+        end=500,
+        strategy="previous",
+        max_gap=150,
+    )
+    # 200 is 100ms after the sample at 100 -> interpolated; 300 is 200ms
+    # after it -> beyond max_gap -> missing
+    assert previous["values"] == [[None], [1.0], [1.0], [None], [2.0]]
+    assert previous["mask"] == [
+        ["missing"],
+        ["observed"],
+        ["interpolated"],
+        ["missing"],
+        ["observed"],
+    ]

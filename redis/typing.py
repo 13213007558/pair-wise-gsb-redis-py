@@ -10,6 +10,7 @@ from typing import (
     Mapping,
     Protocol,
     Type,
+    TypedDict,
     TypeVar,
     Union,
 )
@@ -114,6 +115,19 @@ TimeSeriesMRangeResponse = list[Any] | dict[bytes | str, TimeSeriesMRangeSeries]
 # Timestamp-major row ``[timestamp, [value_for_key_0, value_for_key_1, ...]]``
 # returned by TS.NRANGE / TS.NREVRANGE.
 TimeSeriesNRangeResponse = list[list[int | list[float]]]
+TimeSeriesResampleMask = Literal["observed", "interpolated", "missing"]
+
+
+class TimeSeriesResampleResult(TypedDict):
+    """Row-major resample matrices returned by TimeSeriesCommands.resample."""
+
+    timestamps: list[int]
+    keys: list[Any]
+    labels: list[dict]
+    values: list[list[float | None]]
+    mask: list[list[TimeSeriesResampleMask]]
+
+
 BloomScanDumpResponse = tuple[int, bytes | None]
 ModuleListResponse = list[bytes | int | float | str | None]
 BlockingZSetPopResponse = (

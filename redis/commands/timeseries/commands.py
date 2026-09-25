@@ -1,3 +1,4 @@
+import inspect
 from typing import Any, Awaitable, Dict, Iterable, List, Tuple, overload
 
 from redis.exceptions import DataError
@@ -10,10 +11,18 @@ from redis.typing import (
     TimeSeriesMRangeResponse,
     TimeSeriesNRangeResponse,
     TimeSeriesRangeResponse,
+    TimeSeriesResampleResult,
     TimeSeriesSample,
 )
 
 from .info import TSInfo
+from .utils import (
+    RESAMPLE_EXACT,
+    RESAMPLE_LINEAR,
+    RESAMPLE_STRATEGIES,
+    build_resample_grid,
+    build_resample_result,
+)
 
 ADD_CMD = "TS.ADD"
 ALTER_CMD = "TS.ALTER"
@@ -36,6 +45,10 @@ QUERYLABELS_CMD = "TS.QUERYLABELS"
 RANGE_CMD = "TS.RANGE"
 READ_CMD = "TS.READ"
 REVRANGE_CMD = "TS.REVRANGE"
+
+# Default upper bound on the number of grid points a single resample() call
+# may request; larger grids must be split by the caller (max_points=None).
+DEFAULT_MAX_RESAMPLE_POINTS = 10000
 
 
 class TimeSeriesCommands:
@@ -1739,6 +1752,171 @@ class TimeSeriesCommands:
         return self.execute_command(
             MREVRANGE_CMD, *params, aggregation_type=aggregation_type
         )
+
+    @overload
+    def resample(
+        self: SyncClientProtocol,
+        filters: List[str],
+        origin: int,
+        step: int,
+        start: int,
+        end: int,
+        strategy: str = RESAMPLE_EXACT,
+        max_gap: int | None = None,
+        keys: List[KeyT] | None = None,
+        max_points: int | None = DEFAULT_MAX_RESAMPLE_POINTS,
+    ) -> TimeSeriesResampleResult: ...
+
+    @overload
+    def resample(
+        self: AsyncClientProtocol,
+        filters: List[str],
+        origin: int,
+        step: int,
+        start: int,
+        end: int,
+        strategy: str = RESAMPLE_EXACT,
+        max_gap: int | None = None,
+        keys: List[KeyT] | None = None,
+        max_points: int | None = DEFAULT_MAX_RESAMPLE_POINTS,
+    ) -> Awaitable[TimeSeriesResampleResult]: ...
+
+    def resample(
+        self,
+        filters: List[str],
+        origin: int,
+        step: int,
+        start: int,
+        end: int,
+        strategy: str = RESAMPLE_EXACT,
+        max_gap: int | None = None,
+        keys: List[KeyT] | None = None,
+        max_points: int | None = DEFAULT_MAX_RESAMPLE_POINTS,
+    ) -> TimeSeriesResampleResult | Awaitable[TimeSeriesResampleResult]:
+        """
+        Resample multiple time-series onto a shared time grid, client-side.
+
+        Issues a single TS.MRANGE for raw samples (server-side aggregation
+        buckets are not interpolation, so none is requested) over the grid
+        span, extended by `max_gap` on the sides that need neighbor samples,
+        and aligns the replies onto the grid ``origin + k * step`` clipped to
+        the half-open interval [`start`, `end`). Negative timestamps align on
+        the same lattice.
+
+        Returns a dict with:
+
+        - `timestamps`: the grid points (rows), ascending.
+        - `keys`: the series key of each column.
+        - `labels`: per-column label dicts. Labels are column metadata only;
+          two series with identical labels still occupy separate columns.
+        - `values`: row-major matrix of floats, `None` where the cell is
+          `missing`.
+        - `mask`: row-major matrix of `observed` (sample exactly on the grid
+          point), `interpolated` (derived from neighbors) or `missing`.
+
+        Args:
+            filters:
+                Filter to match the time-series labels, as in TS.MRANGE.
+            origin:
+                Integer millisecond timestamp anchoring the grid.
+            step:
+                Grid spacing in milliseconds; must be a positive integer.
+            start:
+                Start of the half-open interval; the first grid point is the
+                smallest grid timestamp greater than or equal to `start`.
+            end:
+                End of the half-open interval; grid points are strictly
+                smaller than `end`.
+            strategy:
+                Value strategy per grid point: `exact` (only samples exactly
+                on the grid point), `previous` (last sample at or before the
+                grid point) or `linear` (interpolated between the enclosing
+                samples; never extrapolates past either end).
+            max_gap:
+                Maximum distance in milliseconds between a grid point and
+                the neighbor sample(s) for `previous` and `linear`; larger
+                gaps yield `missing`. `None` disables the limit. Ignored by
+                `exact`.
+            keys:
+                Optional explicit column order. Series without samples in
+                the queried range produce all-missing columns. When `None`,
+                columns are the discovered series in sorted-key order, so an
+                arbitrarily ordered reply still yields a stable layout.
+            max_points:
+                Maximum number of grid points allowed in one query; larger
+                grids raise `DataError`. `None` disables the limit.
+        """
+        if strategy not in RESAMPLE_STRATEGIES:
+            raise DataError(f"resample strategy must be one of {RESAMPLE_STRATEGIES}")
+        if not isinstance(step, int) or step <= 0:
+            raise DataError("resample step must be a positive integer")
+        if not isinstance(origin, int):
+            raise DataError("resample origin must be an integer")
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise DataError("resample start and end must be integers")
+        if start >= end:
+            raise DataError("resample start must be smaller than end")
+        if max_gap is not None and (not isinstance(max_gap, int) or max_gap < 0):
+            raise DataError("resample max_gap must be a non-negative integer or None")
+        if max_points is not None and max_points < 1:
+            raise DataError("resample max_points must be a positive integer or None")
+
+        grid = build_resample_grid(origin, step, start, end)
+        if max_points is not None and len(grid) > max_points:
+            raise DataError(
+                f"resample grid has {len(grid)} points, more than "
+                f"max_points={max_points}"
+            )
+        if not grid:
+            column_keys = [] if keys is None else list(keys)
+            return {
+                "timestamps": [],
+                "keys": column_keys,
+                "labels": [{} for _ in column_keys],
+                "values": [],
+                "mask": [],
+            }
+
+        first, last = grid[0], grid[-1]
+        if strategy == RESAMPLE_EXACT:
+            from_time, to_time = first, last
+        else:
+            from_time = first - max_gap if max_gap is not None else "-"
+            if strategy == RESAMPLE_LINEAR:
+                to_time = last + max_gap if max_gap is not None else "+"
+            else:
+                to_time = last
+
+        params = self.__mrange_params(
+            None,
+            0,
+            None,
+            filters,
+            from_time,
+            to_time,
+            True,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            False,
+            False,
+        )
+        response = self.execute_command(MRANGE_CMD, *params)
+        if inspect.iscoroutine(response):
+            # Async client - wrap in coroutine that awaits and resamples
+            async def _resample():
+                return build_resample_result(
+                    await response, grid, strategy, max_gap, keys
+                )
+
+            return _resample()
+        return build_resample_result(response, grid, strategy, max_gap, keys)
 
     @overload
     def get(

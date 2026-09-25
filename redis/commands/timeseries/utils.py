@@ -1,3 +1,5 @@
+from bisect import bisect_right
+
 from ..helpers import nativestr
 
 
@@ -205,3 +207,130 @@ def parse_m_range_resp3_to_resp2_legacy(response, **kwargs):
         samples = item[-1]
         res.append({nativestr(key): [labels, parse_range(samples)]})
     return sorted(res, key=lambda d: list(d.keys()))
+
+
+RESAMPLE_EXACT = "exact"
+RESAMPLE_PREVIOUS = "previous"
+RESAMPLE_LINEAR = "linear"
+RESAMPLE_STRATEGIES = (RESAMPLE_EXACT, RESAMPLE_PREVIOUS, RESAMPLE_LINEAR)
+
+RESAMPLE_OBSERVED = "observed"
+RESAMPLE_INTERPOLATED = "interpolated"
+RESAMPLE_MISSING = "missing"
+
+
+def build_resample_grid(origin, step, start, end):
+    """Integer-millisecond grid ``origin + k * step`` clipped to ``[start, end)``.
+
+    Floor-division based alignment keeps negative timestamps on the same
+    lattice: ``start`` itself is included when it lies on the grid, ``end``
+    is always excluded.
+    """
+    first = -((origin - start) // step)
+    stop = -((origin - end) // step)
+    return [origin + k * step for k in range(first, stop)]
+
+
+def resample_series(samples, grid, strategy, max_gap=None):
+    """Resample one series onto ``grid``.
+
+    ``samples`` are ``(timestamp, value)`` pairs sorted by ascending
+    timestamp, as returned by TS.MRANGE. Returns ``(values, mask)`` aligned
+    with ``grid``; the value is ``None`` wherever the mask is ``missing``.
+
+    - ``exact``: only a sample sitting exactly on the grid point is observed.
+    - ``previous``: the last sample at or before the grid point, at most
+      ``max_gap`` milliseconds away from it.
+    - ``linear``: interpolation between the enclosing samples, each at most
+      ``max_gap`` milliseconds away from the grid point; never extrapolates
+      past either end of the samples.
+
+    A ``NaN`` sample is a real observation: it is reported as-is and
+    propagates through linear interpolation.
+    """
+    timestamps = [int(sample[0]) for sample in samples]
+    last = len(timestamps) - 1
+    values = []
+    mask = []
+    for t in grid:
+        left = bisect_right(timestamps, t) - 1
+        if left >= 0 and timestamps[left] == t:
+            values.append(float(samples[left][1]))
+            mask.append(RESAMPLE_OBSERVED)
+        elif strategy == RESAMPLE_PREVIOUS:
+            if left >= 0 and (max_gap is None or t - timestamps[left] <= max_gap):
+                values.append(float(samples[left][1]))
+                mask.append(RESAMPLE_INTERPOLATED)
+            else:
+                values.append(None)
+                mask.append(RESAMPLE_MISSING)
+        elif strategy == RESAMPLE_LINEAR:
+            if 0 <= left < last and (
+                max_gap is None
+                or (
+                    t - timestamps[left] <= max_gap
+                    and timestamps[left + 1] - t <= max_gap
+                )
+            ):
+                t0, t1 = timestamps[left], timestamps[left + 1]
+                v0 = float(samples[left][1])
+                v1 = float(samples[left + 1][1])
+                values.append(v0 + (v1 - v0) * (t - t0) / (t1 - t0))
+                mask.append(RESAMPLE_INTERPOLATED)
+            else:
+                values.append(None)
+                mask.append(RESAMPLE_MISSING)
+        else:
+            values.append(None)
+            mask.append(RESAMPLE_MISSING)
+    return values, mask
+
+
+def iter_mrange_series(response):
+    """Yield ``(key, labels, samples)`` for each series of a TS.MRANGE reply.
+
+    Accepts both the legacy list-of-single-key-dicts shape and the unified
+    ``{key: [labels, metadata, samples]}`` shape. Series are identified
+    solely by their Redis key; labels are metadata and never used to
+    identify or merge series.
+    """
+    if isinstance(response, dict):
+        for key, entry in response.items():
+            yield key, entry[0], entry[-1]
+    else:
+        for item in response:
+            for key, entry in item.items():
+                yield key, entry[0], entry[-1]
+
+
+def build_resample_result(response, grid, strategy, max_gap=None, keys=None):
+    """Build the row-major resample matrix for a TS.MRANGE reply.
+
+    Columns follow ``keys`` when given (caller-fixed order; series without
+    samples produce all-missing columns), otherwise the discovered series
+    in sorted-key order, so an arbitrarily ordered reply still yields a
+    stable column layout.
+    """
+    discovered = {}
+    for key, labels, samples in iter_mrange_series(response):
+        discovered[nativestr(key)] = (key, labels, samples)
+    if keys is None:
+        columns = [discovered[name] for name in sorted(discovered)]
+    else:
+        columns = [discovered.get(nativestr(key), (key, {}, [])) for key in keys]
+    per_series = [
+        resample_series(samples, grid, strategy, max_gap) for _, _, samples in columns
+    ]
+    return {
+        "timestamps": list(grid),
+        "keys": [key for key, _, _ in columns],
+        "labels": [labels for _, labels, _ in columns],
+        "values": [
+            [column_values[row] for column_values, _ in per_series]
+            for row in range(len(grid))
+        ],
+        "mask": [
+            [column_mask[row] for _, column_mask in per_series]
+            for row in range(len(grid))
+        ],
+    }

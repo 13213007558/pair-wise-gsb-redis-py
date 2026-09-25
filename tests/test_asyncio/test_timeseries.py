@@ -1,3 +1,4 @@
+import math
 import time
 from time import sleep
 
@@ -1917,3 +1918,91 @@ async def test_nrevrange_count_keeps_highest_timestamps(decoded_r: redis.Redis):
     _assert_nrange_rows(res, [[0, [0.0]], [1, [1.0]]])
     res = await decoded_r.ts().nrevrange(["{s}:a"], from_time="-", to_time="+", count=2)
     _assert_nrange_rows(res, [[4, [4.0]], [3, [3.0]]])
+
+
+@pytest.mark.redismod
+async def test_resample_linear_matrix_and_mask(decoded_r: redis.Redis):
+    # mirror of tests/test_timeseries.py::test_resample_linear_matrix_and_mask
+    await decoded_r.ts().create("resample:s1", labels={"grp": "resample-async"})
+    await decoded_r.ts().create("resample:s2", labels={"grp": "resample-async"})
+    await decoded_r.ts().create("resample:s3", labels={"grp": "resample-async"})
+    await decoded_r.ts().add("resample:s1", 0, 1.0)
+    await decoded_r.ts().add("resample:s1", 1000, 5.0)
+    await decoded_r.ts().add("resample:s2", 0, float("nan"))
+    await decoded_r.ts().add("resample:s2", 250, 2.0)
+    await decoded_r.ts().add("resample:s3", 500, 3.0)
+
+    result = await decoded_r.ts().resample(
+        ["grp=resample-async"],
+        origin=0,
+        step=250,
+        start=0,
+        end=1000,
+        strategy="linear",
+        max_gap=500,
+        keys=["resample:s1", "resample:s2", "resample:s3"],
+    )
+    assert result["timestamps"] == [0, 250, 500, 750]
+    assert result["keys"] == ["resample:s1", "resample:s2", "resample:s3"]
+    assert result["labels"] == [{"grp": "resample-async"}] * 3
+    values = result["values"]
+    mask = result["mask"]
+    assert values[0][0] == 1.0
+    assert mask[0][0] == "observed"
+    assert values[1][0] is None
+    assert mask[1][0] == "missing"
+    assert values[2][0] == 3.0
+    assert mask[2][0] == "interpolated"
+    assert values[3][0] is None
+    assert mask[3][0] == "missing"
+    assert math.isnan(values[0][1])
+    assert mask[0][1] == "observed"
+    assert values[1][1] == 2.0
+    assert mask[1][1] == "observed"
+    assert values[2][1] is None
+    assert values[3][1] is None
+    assert values[2][2] == 3.0
+    assert [row[2] for row in mask] == ["missing", "missing", "observed", "missing"]
+
+
+@pytest.mark.redismod
+async def test_resample_exact_and_previous(decoded_r: redis.Redis):
+    await decoded_r.ts().create("resample:p", labels={"grp": "resample-async-p"})
+    await decoded_r.ts().add("resample:p", 100, 1.0)
+    await decoded_r.ts().add("resample:p", 400, 2.0)
+
+    exact = await decoded_r.ts().resample(
+        ["grp=resample-async-p"],
+        origin=0,
+        step=100,
+        start=0,
+        end=500,
+        strategy="exact",
+    )
+    assert exact["timestamps"] == [0, 100, 200, 300, 400]
+    assert exact["values"] == [[None], [1.0], [None], [None], [2.0]]
+    assert exact["mask"] == [
+        ["missing"],
+        ["observed"],
+        ["missing"],
+        ["missing"],
+        ["observed"],
+    ]
+
+    previous = await decoded_r.ts().resample(
+        ["grp=resample-async-p"],
+        origin=0,
+        step=100,
+        start=0,
+        end=500,
+        strategy="previous",
+        max_gap=150,
+    )
+    assert previous["values"] == [[None], [1.0], [1.0], [None], [2.0]]
+    assert previous["mask"] == [
+        ["missing"],
+        ["observed"],
+        ["interpolated"],
+        ["missing"],
+        ["observed"],
+    ]
