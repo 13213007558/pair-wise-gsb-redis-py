@@ -6,6 +6,7 @@ from ..typing import EncodableT
 from ..utils import SENTINEL
 from .base import (
     AsyncPushNotificationsParser,
+    AttributedResponse,
     PushNotificationsParser,
     _AsyncRESPBase,
     _RESPBase,
@@ -14,10 +15,21 @@ from .socket import SERVER_CLOSED_CONNECTION_ERROR
 
 
 class _RESP3Parser(_RESPBase, PushNotificationsParser):
-    """RESP3 protocol implementation"""
+    """RESP3 protocol implementation
+
+    RESP3 attribute sections (the `|` type) modify the reply that
+    follows them. They are always parsed off the wire - they never count
+    as a reply of their own (e.g. in pipelines) nor towards the element
+    count of an enclosing aggregate - but they are only surfaced when
+    `response_attributes_enabled` is set: reply values preceded by an
+    attribute section are then returned as `AttributedResponse` at the
+    position the plain value would have occupied. Attribute sections in
+    front of error replies are discarded so error semantics are preserved.
+    """
 
     def __init__(self, socket_read_size):
         super().__init__(socket_read_size)
+        self.response_attributes_enabled = False
         self.pubsub_push_handler_func = self.handle_pubsub_push_response
         self.node_moving_push_handler_func = None
         self.maintenance_push_handler_func = None
@@ -61,12 +73,38 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         disable_decoding=False,
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
+        attributes=None,
     ):
         raw = self._buffer.readline(timeout=timeout)
         if not raw:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
 
         byte, response = raw[:1], raw[1:]
+
+        # attribute section: out-of-band metadata modifying the reply that
+        # follows it. Read the section, merge it with any sections already
+        # collected for this reply, and continue with the modified reply.
+        if byte == b"|":
+            section = {}
+            for _ in range(int(response)):
+                key = self._read_response(
+                    disable_decoding=disable_decoding, timeout=timeout
+                )
+                section[key] = self._read_response(
+                    disable_decoding=disable_decoding, timeout=timeout
+                )
+            if attributes:
+                # Consecutive attribute sections modify the same reply;
+                # merge them with later sections overriding earlier ones.
+                attributes.update(section)
+            else:
+                attributes = section
+            return self._read_response(
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                timeout=timeout,
+                attributes=attributes,
+            )
 
         # server returned an error
         if byte in (b"-", b"!"):
@@ -88,16 +126,16 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
             pass
         # null value
         elif byte == b"_":
-            return None
+            response = None
         # int and big int values
         elif byte in (b":", b"("):
-            return int(response)
+            response = int(response)
         # double value
         elif byte == b",":
-            return float(response)
+            response = float(response)
         # bool value
         elif byte == b"#":
-            return response == b"t"
+            response = response == b"t"
         # bulk response
         elif byte == b"$":
             response = self._buffer.read(int(response), timeout=timeout)
@@ -144,7 +182,9 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                 )
                 for _ in range(int(response))
             ]
-            response = self.handle_push_response(response)
+            # the attributes collected so far belong to this push message,
+            # not to the command reply that follows it
+            response = self.handle_push_response(response, attributes=attributes)
 
             # if this is a push request return the push response
             if push_request:
@@ -166,12 +206,29 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         if isinstance(response, bytes) and disable_decoding is False:
             response = self.encoder.decode(response)
 
+        if attributes is not None:
+            response = self._attach_attributes(response, attributes)
+
+        return response
+
+    def _attach_attributes(self, response, attributes):
+        if self.response_attributes_enabled:
+            return AttributedResponse(response, attributes)
         return response
 
 
 class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
+    """Async RESP3 protocol implementation.
+
+    Mirrors `_RESP3Parser`: RESP3 attribute sections (the `|` type)
+    are always parsed off the wire and are only surfaced - as
+    `AttributedResponse` wrappers at the position of the value they
+    modify - when `response_attributes_enabled` is set.
+    """
+
     def __init__(self, socket_read_size):
         super().__init__(socket_read_size)
+        self.response_attributes_enabled = False
         self.pubsub_push_handler_func = self.handle_pubsub_push_response
         self.invalidation_push_handler_func = None
 
@@ -198,7 +255,10 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         return response
 
     async def _read_response(
-        self, disable_decoding: bool = False, push_request: bool = False
+        self,
+        disable_decoding: bool = False,
+        push_request: bool = False,
+        attributes=None,
     ) -> Union[EncodableT, ResponseError, None]:
         if not self._stream or not self.encoder:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -206,8 +266,27 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         response: Any
         byte, response = raw[:1], raw[1:]
 
-        # if byte not in (b"-", b"+", b":", b"$", b"*"):
-        #     raise InvalidResponse(f"Protocol Error: {raw!r}")
+        # attribute section: out-of-band metadata modifying the reply that
+        # follows it. Read the section, merge it with any sections already
+        # collected for this reply, and continue with the modified reply.
+        if byte == b"|":
+            section = {}
+            for _ in range(int(response)):
+                key = await self._read_response(disable_decoding=disable_decoding)
+                section[key] = await self._read_response(
+                    disable_decoding=disable_decoding
+                )
+            if attributes:
+                # Consecutive attribute sections modify the same reply;
+                # merge them with later sections overriding earlier ones.
+                attributes.update(section)
+            else:
+                attributes = section
+            return await self._read_response(
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                attributes=attributes,
+            )
 
         # server returned an error
         if byte in (b"-", b"!"):
@@ -230,16 +309,16 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             pass
         # null value
         elif byte == b"_":
-            return None
+            response = None
         # int and big int values
         elif byte in (b":", b"("):
-            return int(response)
+            response = int(response)
         # double value
         elif byte == b",":
-            return float(response)
+            response = float(response)
         # bool value
         elif byte == b"#":
-            return response == b"t"
+            response = response == b"t"
         # bulk response
         elif byte == b"$":
             response = await self._read(int(response))
@@ -282,7 +361,9 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
                 )
                 for _ in range(int(response))
             ]
-            response = await self.handle_push_response(response)
+            # the attributes collected so far belong to this push message,
+            # not to the command reply that follows it
+            response = await self.handle_push_response(response, attributes=attributes)
             if not push_request:
                 return await self._read_response(
                     disable_decoding=disable_decoding, push_request=push_request
@@ -294,4 +375,13 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
 
         if isinstance(response, bytes) and disable_decoding is False:
             response = self.encoder.decode(response)
+
+        if attributes is not None:
+            response = self._attach_attributes(response, attributes)
+
+        return response
+
+    def _attach_attributes(self, response, attributes):
+        if self.response_attributes_enabled:
+            return AttributedResponse(response, attributes)
         return response

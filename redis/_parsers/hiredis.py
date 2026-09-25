@@ -107,6 +107,22 @@ class _HiredisReaderArgs(TypedDict, total=False):
 class _HiredisParser(BaseParser, PushNotificationsParser):
     "Parser class for connections using Hiredis"
 
+    @property
+    def response_attributes_enabled(self) -> bool:
+        # hiredis parses RESP3 attribute sections internally but does not
+        # expose them, so there is nothing to opt into on this parser.
+        return False
+
+    @response_attributes_enabled.setter
+    def response_attributes_enabled(self, enabled: bool) -> None:
+        if enabled:
+            raise RedisError(
+                "RESP3 response attributes are not supported by the hiredis "
+                "parser: hiredis does not expose reply attributes. Use the "
+                "pure-Python RESP3 parser (parser_class=_RESP3Parser) to "
+                "access response attributes."
+            )
+
     def __init__(self, socket_read_size):
         if not HIREDIS_AVAILABLE:
             raise RedisError("Hiredis is not installed")
@@ -291,6 +307,22 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
     """Async implementation of parser class for connections using Hiredis"""
 
     __slots__ = ("_reader",)
+
+    @property
+    def response_attributes_enabled(self) -> bool:
+        # hiredis parses RESP3 attribute sections internally but does not
+        # expose them, so there is nothing to opt into on this parser.
+        return False
+
+    @response_attributes_enabled.setter
+    def response_attributes_enabled(self, enabled: bool) -> None:
+        if enabled:
+            raise RedisError(
+                "RESP3 response attributes are not supported by the hiredis "
+                "parser: hiredis does not expose reply attributes. Use the "
+                "pure-Python RESP3 parser (parser_class=_AsyncRESP3Parser) "
+                "to access response attributes."
+            )
 
     def __init__(self, socket_read_size: int):
         if not HIREDIS_AVAILABLE:

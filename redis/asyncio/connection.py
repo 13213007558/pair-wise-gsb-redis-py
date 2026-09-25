@@ -638,6 +638,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         credential_provider: CredentialProvider | None = None,
         protocol: int | None = None,
         legacy_responses: bool = True,
+        response_attributes: bool = False,
         event_dispatcher: EventDispatcher | None = None,
         maint_notifications_config: MaintNotificationsConfig | None = None,
         maint_notifications_pool_handler: (
@@ -666,6 +667,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             **Deprecated.** Use driver_info instead. Library name for CLIENT SETINFO.
         lib_version : str, optional
             **Deprecated.** Use driver_info instead. Library version for CLIENT SETINFO.
+        response_attributes : bool, optional
+            Opt in to RESP3 response attributes (the `|` reply type).
+            When True, reply values preceded by an attribute section are
+            returned as `redis._parsers.AttributedResponse` at the position
+            the plain value would have occupied. Requires a pure-Python
+            RESP3 parser; hiredis does not expose reply attributes.
         """
         if (username or password) and credential_provider is not None:
             raise DataError(
@@ -736,6 +743,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 raise ConnectionError("protocol must be either 2 or 3")
         self.protocol = p
         self.legacy_responses = legacy_responses
+        self._response_attributes = response_attributes
         if parser_class != _AsyncHiredisParser:
             # The Python parsers are protocol-specific; hiredis supports both.
             if self.protocol == 3 and parser_class == _AsyncRESP2Parser:
@@ -828,6 +836,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         :param parser_class: The required parser class
         """
         self._parser = parser_class(socket_read_size=self._socket_read_size)
+        if getattr(self, "_response_attributes", False):
+            # Opted-in RESP3 response attributes; the hiredis parser raises
+            # here since it cannot expose reply attributes.
+            self._parser.response_attributes_enabled = True
 
     def _get_parser(self) -> BaseParser:
         return self._parser

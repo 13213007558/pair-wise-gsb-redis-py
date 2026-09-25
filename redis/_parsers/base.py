@@ -1,7 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
 from asyncio import IncompleteReadError, StreamReader
-from typing import Awaitable, Callable, List, Optional, Protocol, Union
+from typing import Any, Awaitable, Callable, List, Optional, Protocol, Union
 
 from redis.maint_notifications import (
     MaintenanceNotification,
@@ -70,6 +70,42 @@ NO_SUCH_FIELDSET_ERROR = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+class AttributedResponse:
+    """A RESP3 reply value together with the attributes that modified it.
+
+    RESP3 attribute sections (the `|` type) carry out-of-band metadata
+    about the reply that follows them. The RESP3 parsers only surface them
+    when response attributes are explicitly enabled (see
+    `response_attributes_enabled` on the RESP3 parsers and the
+    `response_attributes` connection option); otherwise the attributes
+    are parsed off the wire and discarded so reply shapes stay unchanged.
+
+    When attributes are enabled, any reply value that was preceded by an
+    attribute section is returned as an `AttributedResponse` at the exact
+    position the plain value would have occupied (including nested
+    positions inside aggregates): `value` holds the reply itself and
+    `attributes` the merged attribute mapping. When several attribute
+    sections precede one reply they are merged into a single mapping, with
+    keys from later sections overriding earlier ones.
+    """
+
+    __slots__ = ("value", "attributes")
+
+    def __init__(self, value: Any, attributes: dict) -> None:
+        self.value = value
+        self.attributes = attributes
+
+    def __eq__(self, other):
+        if isinstance(other, AttributedResponse):
+            return self.value == other.value and self.attributes == other.attributes
+        return NotImplemented
+
+    def __repr__(self):
+        return (
+            f"AttributedResponse(value={self.value!r}, attributes={self.attributes!r})"
+        )
 
 
 class BaseParser(ABC):
@@ -339,6 +375,7 @@ class PushNotificationsParser(Protocol):
         raise NotImplementedError()
 
     def handle_push_response(self, response, **kwargs):
+        attributes = kwargs.get("attributes")
         msg_type = response[0]
         if isinstance(msg_type, bytes):
             msg_type = msg_type.decode()
@@ -349,7 +386,9 @@ class PushNotificationsParser(Protocol):
             _MOVING_MESSAGE,
             _SMIGRATED_MESSAGE,
         ):
-            return self.pubsub_push_handler_func(response)
+            return self.pubsub_push_handler_func(
+                self._attach_push_attributes(response, attributes)
+            )
 
         try:
             if (
@@ -401,6 +440,21 @@ class PushNotificationsParser(Protocol):
 
         return None
 
+    def _attach_push_attributes(self, response, attributes):
+        """Attach the attributes of a push message to its payload.
+
+        Attributes that precede a push message belong to that message, so
+        they are handed to the push handler together with the payload and
+        are never carried over to the next command reply. They are only
+        surfaced when the parser is opted in to response attributes;
+        otherwise they are discarded.
+        """
+        if attributes is None or not getattr(
+            self, "response_attributes_enabled", False
+        ):
+            return response
+        return AttributedResponse(response, attributes)
+
     def set_pubsub_push_handler(self, pubsub_push_handler_func):
         self.pubsub_push_handler_func = pubsub_push_handler_func
 
@@ -433,6 +487,7 @@ class AsyncPushNotificationsParser(Protocol):
     async def handle_push_response(self, response, **kwargs):
         """Handle push responses asynchronously"""
 
+        attributes = kwargs.get("attributes")
         msg_type = response[0]
         if isinstance(msg_type, bytes):
             msg_type = msg_type.decode()
@@ -443,7 +498,9 @@ class AsyncPushNotificationsParser(Protocol):
             _MOVING_MESSAGE,
             _SMIGRATED_MESSAGE,
         ):
-            return await self.pubsub_push_handler_func(response)
+            return await self.pubsub_push_handler_func(
+                self._attach_push_attributes(response, attributes)
+            )
 
         try:
             if (
@@ -492,6 +549,21 @@ class AsyncPushNotificationsParser(Protocol):
             )
 
         return None
+
+    def _attach_push_attributes(self, response, attributes):
+        """Attach the attributes of a push message to its payload.
+
+        Attributes that precede a push message belong to that message, so
+        they are handed to the push handler together with the payload and
+        are never carried over to the next command reply. They are only
+        surfaced when the parser is opted in to response attributes;
+        otherwise they are discarded.
+        """
+        if attributes is None or not getattr(
+            self, "response_attributes_enabled", False
+        ):
+            return response
+        return AttributedResponse(response, attributes)
 
     def set_pubsub_push_handler(self, pubsub_push_handler_func):
         """Set the pubsub push handler function"""
