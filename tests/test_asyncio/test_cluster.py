@@ -2775,6 +2775,114 @@ class TestClusterRedisCommands:
             await r.hotkeys_stop()
 
 
+class TestClusterNonAtomicZSetCommands:
+    """
+    The client-side non-atomic sorted set aggregations read every input
+    key with its own ZRANGE, so each read must be routed to the node
+    holding the key's slot.
+    """
+
+    @staticmethod
+    async def get_mocked_client():
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        r.commands_parser.commands["zrange"] = {
+            "name": "zrange",
+            "arity": -4,
+            "flags": ["readonly"],
+            "first_key_pos": 1,
+            "last_key_pos": 1,
+            "step_count": 1,
+        }
+        return r
+
+    async def test_zunion_nonatomic_routes_each_read_to_its_slot(self):
+        r = await self.get_mocked_client()
+        node0 = r.get_node(default_host, 7000)
+        node1 = r.get_node(default_host, 7001)
+        assert r.nodes_manager.get_node_from_slot(key_slot(b"z{b}")) == node0
+        assert r.nodes_manager.get_node_from_slot(key_slot(b"z{a}")) == node1
+        mock_node_resp(node0, [[b"b1", 2.0], [b"shared", 1.0]])
+        mock_node_resp(node1, [[b"a1", 1.0], [b"shared", 3.0]])
+        assert await r.zunion_nonatomic(["z{a}", "z{b}"], withscores=True) == [
+            (b"a1", 1.0),
+            (b"b1", 2.0),
+            (b"shared", 4.0),
+        ]
+        conn0 = node0._free[0]
+        conn1 = node1._free[0]
+        assert conn0.read_response.call_count == 1
+        assert conn1.read_response.call_count == 1
+        assert conn0.pack_command.call_args_list[0].args[:2] == ("ZRANGE", "z{b}")
+        assert conn1.pack_command.call_args_list[0].args[:2] == ("ZRANGE", "z{a}")
+
+    async def test_zunion_nonatomic_with_weights(self):
+        r = await self.get_mocked_client()
+        node0 = r.get_node(default_host, 7000)
+        node1 = r.get_node(default_host, 7001)
+        mock_node_resp(node0, [[b"m", 2.0]])
+        mock_node_resp(node1, [[b"m", 3.0]])
+        assert await r.zunion_nonatomic({"z{a}": 2, "z{b}": 3}, withscores=True) == [
+            (b"m", 12.0)
+        ]
+
+    async def test_zunion_nonatomic_same_slot_keys_read_from_one_node(self):
+        r = await self.get_mocked_client()
+        node0 = r.get_node(default_host, 7000)
+        node1 = r.get_node(default_host, 7001)
+        assert r.nodes_manager.get_node_from_slot(key_slot(b"z{b}")) == node0
+        assert r.nodes_manager.get_node_from_slot(key_slot(b"z{c}")) == node0
+        mock_node_resp(node0, [[b"m", 1.0]])
+        mock_node_resp(node1, [])
+        assert await r.zunion_nonatomic(["z{b}", "z{c}"], withscores=True) == [
+            (b"m", 2.0)
+        ]
+        conn0 = node0._free[0]
+        conn1 = node1._free[0]
+        assert conn0.read_response.call_count == 2
+        assert conn1.read_response.call_count == 0
+
+    async def test_zinter_nonatomic_routes_each_read_to_its_slot(self):
+        r = await self.get_mocked_client()
+        node0 = r.get_node(default_host, 7000)
+        node1 = r.get_node(default_host, 7001)
+        mock_node_resp(node0, [[b"shared", 2.0], [b"b1", 5.0]])
+        mock_node_resp(node1, [[b"shared", 3.0], [b"a1", 1.0]])
+        assert await r.zinter_nonatomic(["z{a}", "z{b}"], withscores=True) == [
+            (b"shared", 5.0)
+        ]
+        conn0 = node0._free[0]
+        conn1 = node1._free[0]
+        assert conn0.read_response.call_count == 1
+        assert conn1.read_response.call_count == 1
+        assert conn0.pack_command.call_args_list[0].args[:2] == ("ZRANGE", "z{b}")
+        assert conn1.pack_command.call_args_list[0].args[:2] == ("ZRANGE", "z{a}")
+
+    async def test_zdiff_nonatomic_routes_each_read_to_its_slot(self):
+        r = await self.get_mocked_client()
+        node0 = r.get_node(default_host, 7000)
+        node1 = r.get_node(default_host, 7001)
+        mock_node_resp(node0, [[b"shared", 1.0]])
+        mock_node_resp(node1, [[b"a1", 1.0], [b"shared", 3.0]])
+        assert await r.zdiff_nonatomic(["z{a}", "z{b}"], withscores=True) == [
+            (b"a1", 1.0)
+        ]
+        conn0 = node0._free[0]
+        conn1 = node1._free[0]
+        assert conn0.read_response.call_count == 1
+        assert conn1.read_response.call_count == 1
+        assert conn0.pack_command.call_args_list[0].args[:2] == ("ZRANGE", "z{b}")
+        assert conn1.pack_command.call_args_list[0].args[:2] == ("ZRANGE", "z{a}")
+
+    async def test_nonatomic_zset_commands_require_keys(self):
+        r = await self.get_mocked_client()
+        with pytest.raises(DataError):
+            await r.zunion_nonatomic([])
+        with pytest.raises(DataError):
+            await r.zinter_nonatomic([])
+        with pytest.raises(DataError):
+            await r.zdiff_nonatomic([])
+
+
 class TestStaticMetadataRouting:
     """
     Every command ``_STATIC_COMMAND_METADATA`` routes by its keys must reach the node holding

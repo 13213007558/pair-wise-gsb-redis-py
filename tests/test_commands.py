@@ -5501,6 +5501,133 @@ class TestRedisCommands:
             [[b"a2", 3], [b"a4", 3], [b"a1", 6], [b"a3", 6]],
         )
 
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    def test_zunion_nonatomic(self, r):
+        r.zadd("a", {"a1": 1, "a2": 1, "a3": 1})
+        r.zadd("b", {"a1": 2, "a2": 2, "a3": 2})
+        r.zadd("c", {"a1": 6, "a3": 5, "a4": 4})
+        keys = ["a", "b", "c"]
+        assert r.zunion_nonatomic(keys) == r.zunion(keys)
+        assert r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in r.zunion(keys, withscores=True)
+        ]
+        for aggregate in ("SUM", "MIN", "MAX"):
+            native = r.zunion(keys, aggregate=aggregate, withscores=True)
+            assert r.zunion_nonatomic(keys, aggregate=aggregate, withscores=True) == [
+                tuple(pair) for pair in native
+            ]
+        # with weights
+        weights = {"a": 1, "b": 2, "c": 3}
+        assert r.zunion_nonatomic(weights, withscores=True) == [
+            tuple(pair) for pair in r.zunion(weights, withscores=True)
+        ]
+        # invalid aggregation
+        with pytest.raises(exceptions.DataError):
+            r.zunion_nonatomic(keys, aggregate="foo")
+        # no input keys
+        with pytest.raises(exceptions.DataError):
+            r.zunion_nonatomic([])
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    def test_zunion_nonatomic_edge_cases(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2})
+        r.zadd("b", {"a1": 3, "a2": 4})
+        # negative weights
+        weights = {"a": -2, "b": 0.5}
+        assert r.zunion_nonatomic(weights, withscores=True) == [
+            tuple(pair) for pair in r.zunion(weights, withscores=True)
+        ]
+        # infinite scores
+        r.zadd("inf", {"i1": float("inf"), "i2": float("-inf")})
+        keys = ["a", "inf"]
+        assert r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in r.zunion(keys, withscores=True)
+        ]
+        # duplicate input keys are counted multiple times
+        keys = ["a", "a", "b"]
+        assert r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in r.zunion(keys, withscores=True)
+        ]
+        # empty and missing sets
+        keys = ["a", "missing"]
+        assert r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in r.zunion(keys, withscores=True)
+        ]
+        assert r.zunion_nonatomic(["missing"]) == []
+        # members are identified by their encoded bytes: the string "1",
+        # the integer 1 and the bytes b"1" are the same member
+        r.zadd("s1", {"1": 1})
+        r.zadd("s2", {1: 2})
+        assert r.zunion_nonatomic(["s1", "s2"], withscores=True) == [(b"1", 3.0)]
+        # byte-distinct members stay distinct
+        r.zadd("s3", {b"\xff": 1})
+        r.zadd("s4", {b"\xfe": 2})
+        assert r.zunion_nonatomic(["s3", "s4"], withscores=True) == [
+            (b"\xff", 1.0),
+            (b"\xfe", 2.0),
+        ]
+        # members with equal scores are ordered by their encoded bytes
+        r.zadd("s5", {"b": 1, "a": 1, "c": 1})
+        assert r.zunion_nonatomic(["s5"]) == [b"a", b"b", b"c"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    def test_zinter_nonatomic(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 1})
+        r.zadd("b", {"a1": 2, "a2": 2, "a3": 2})
+        r.zadd("c", {"a1": 6, "a3": 5, "a4": 4})
+        keys = ["a", "b", "c"]
+        assert r.zinter_nonatomic(keys) == r.zinter(keys)
+        assert r.zinter_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in r.zinter(keys, withscores=True)
+        ]
+        for aggregate in ("SUM", "MIN", "MAX"):
+            native = r.zinter(keys, aggregate=aggregate, withscores=True)
+            assert r.zinter_nonatomic(keys, aggregate=aggregate, withscores=True) == [
+                tuple(pair) for pair in native
+            ]
+        # with weights
+        weights = {"a": 1, "b": 2, "c": 3}
+        assert r.zinter_nonatomic(weights, withscores=True) == [
+            tuple(pair) for pair in r.zinter(weights, withscores=True)
+        ]
+        # an empty input set empties the intersection
+        assert r.zinter_nonatomic(["a", "missing"]) == []
+        # duplicate input keys are counted multiple times
+        keys = ["a", "a"]
+        assert r.zinter_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in r.zinter(keys, withscores=True)
+        ]
+        # invalid aggregation
+        with pytest.raises(exceptions.DataError):
+            r.zinter_nonatomic(["a", "b"], aggregate="foo")
+        # no input keys
+        with pytest.raises(exceptions.DataError):
+            r.zinter_nonatomic([])
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    def test_zdiff_nonatomic(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
+        r.zadd("b", {"a1": 1, "a2": 2})
+        keys = ["a", "b"]
+        assert r.zdiff_nonatomic(keys) == r.zdiff(keys)
+        assert r.zdiff_nonatomic(keys, withscores=True) == [(b"a3", 3.0)]
+        # the first set minus itself is empty
+        assert r.zdiff_nonatomic(["a", "a"]) == []
+        # empty and missing sets
+        assert r.zdiff_nonatomic(["missing", "a"]) == []
+        assert r.zdiff_nonatomic(["a", "missing"], withscores=True) == [
+            (b"a1", 1.0),
+            (b"a2", 2.0),
+            (b"a3", 3.0),
+        ]
+        # no input keys
+        with pytest.raises(exceptions.DataError):
+            r.zdiff_nonatomic([])
+
     @skip_if_server_version_lt("6.1.240")
     def test_zmscore(self, r):
         with pytest.raises(exceptions.DataError):

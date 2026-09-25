@@ -4171,6 +4171,133 @@ class TestRedisCommands:
             [[b"a2", 3.0], [b"a4", 3.0], [b"a1", 6.0], [b"a3", 6.0]],
         )
 
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    async def test_zunion_nonatomic(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 1, "a3": 1})
+        await r.zadd("b", {"a1": 2, "a2": 2, "a3": 2})
+        await r.zadd("c", {"a1": 6, "a3": 5, "a4": 4})
+        keys = ["a", "b", "c"]
+        assert await r.zunion_nonatomic(keys) == await r.zunion(keys)
+        assert await r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in await r.zunion(keys, withscores=True)
+        ]
+        for aggregate in ("SUM", "MIN", "MAX"):
+            native = await r.zunion(keys, aggregate=aggregate, withscores=True)
+            assert await r.zunion_nonatomic(
+                keys, aggregate=aggregate, withscores=True
+            ) == [tuple(pair) for pair in native]
+        # with weights
+        weights = {"a": 1, "b": 2, "c": 3}
+        assert await r.zunion_nonatomic(weights, withscores=True) == [
+            tuple(pair) for pair in await r.zunion(weights, withscores=True)
+        ]
+        # invalid aggregation
+        with pytest.raises(exceptions.DataError):
+            await r.zunion_nonatomic(keys, aggregate="foo")
+        # no input keys
+        with pytest.raises(exceptions.DataError):
+            await r.zunion_nonatomic([])
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    async def test_zunion_nonatomic_edge_cases(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2})
+        await r.zadd("b", {"a1": 3, "a2": 4})
+        # negative weights
+        weights = {"a": -2, "b": 0.5}
+        assert await r.zunion_nonatomic(weights, withscores=True) == [
+            tuple(pair) for pair in await r.zunion(weights, withscores=True)
+        ]
+        # infinite scores
+        await r.zadd("inf", {"i1": float("inf"), "i2": float("-inf")})
+        keys = ["a", "inf"]
+        assert await r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in await r.zunion(keys, withscores=True)
+        ]
+        # duplicate input keys are counted multiple times
+        keys = ["a", "a", "b"]
+        assert await r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in await r.zunion(keys, withscores=True)
+        ]
+        # empty and missing sets
+        keys = ["a", "missing"]
+        assert await r.zunion_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in await r.zunion(keys, withscores=True)
+        ]
+        assert await r.zunion_nonatomic(["missing"]) == []
+        # members are identified by their encoded bytes: the string "1",
+        # the integer 1 and the bytes b"1" are the same member
+        await r.zadd("s1", {"1": 1})
+        await r.zadd("s2", {1: 2})
+        assert await r.zunion_nonatomic(["s1", "s2"], withscores=True) == [(b"1", 3.0)]
+        # byte-distinct members stay distinct
+        await r.zadd("s3", {b"\xff": 1})
+        await r.zadd("s4", {b"\xfe": 2})
+        assert await r.zunion_nonatomic(["s3", "s4"], withscores=True) == [
+            (b"\xff", 1.0),
+            (b"\xfe", 2.0),
+        ]
+        # members with equal scores are ordered by their encoded bytes
+        await r.zadd("s5", {"b": 1, "a": 1, "c": 1})
+        assert await r.zunion_nonatomic(["s5"]) == [b"a", b"b", b"c"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    async def test_zinter_nonatomic(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 1})
+        await r.zadd("b", {"a1": 2, "a2": 2, "a3": 2})
+        await r.zadd("c", {"a1": 6, "a3": 5, "a4": 4})
+        keys = ["a", "b", "c"]
+        assert await r.zinter_nonatomic(keys) == await r.zinter(keys)
+        assert await r.zinter_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in await r.zinter(keys, withscores=True)
+        ]
+        for aggregate in ("SUM", "MIN", "MAX"):
+            native = await r.zinter(keys, aggregate=aggregate, withscores=True)
+            assert await r.zinter_nonatomic(
+                keys, aggregate=aggregate, withscores=True
+            ) == [tuple(pair) for pair in native]
+        # with weights
+        weights = {"a": 1, "b": 2, "c": 3}
+        assert await r.zinter_nonatomic(weights, withscores=True) == [
+            tuple(pair) for pair in await r.zinter(weights, withscores=True)
+        ]
+        # an empty input set empties the intersection
+        assert await r.zinter_nonatomic(["a", "missing"]) == []
+        # duplicate input keys are counted multiple times
+        keys = ["a", "a"]
+        assert await r.zinter_nonatomic(keys, withscores=True) == [
+            tuple(pair) for pair in await r.zinter(keys, withscores=True)
+        ]
+        # invalid aggregation
+        with pytest.raises(exceptions.DataError):
+            await r.zinter_nonatomic(["a", "b"], aggregate="foo")
+        # no input keys
+        with pytest.raises(exceptions.DataError):
+            await r.zinter_nonatomic([])
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    async def test_zdiff_nonatomic(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
+        await r.zadd("b", {"a1": 1, "a2": 2})
+        keys = ["a", "b"]
+        assert await r.zdiff_nonatomic(keys) == await r.zdiff(keys)
+        assert await r.zdiff_nonatomic(keys, withscores=True) == [(b"a3", 3.0)]
+        # the first set minus itself is empty
+        assert await r.zdiff_nonatomic(["a", "a"]) == []
+        # empty and missing sets
+        assert await r.zdiff_nonatomic(["missing", "a"]) == []
+        assert await r.zdiff_nonatomic(["a", "missing"], withscores=True) == [
+            (b"a1", 1.0),
+            (b"a2", 2.0),
+            (b"a3", 3.0),
+        ]
+        # no input keys
+        with pytest.raises(exceptions.DataError):
+            await r.zdiff_nonatomic([])
+
     # HYPERLOGLOG TESTS
     @skip_if_server_version_lt("2.8.9")
     async def test_pfadd(self, r: redis.Redis):

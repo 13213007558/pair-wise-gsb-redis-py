@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import inspect
+import math
 
 # Try to import the xxhash library as an optional dependency
 try:
@@ -110,6 +111,7 @@ if TYPE_CHECKING:
     import redis.asyncio.cluster
     import redis.client
     import redis.cluster
+    from redis._parsers import Encoder
 
 
 class ACLCommands(CommandsProtocol):
@@ -8265,6 +8267,122 @@ class StreamCommands(CommandsProtocol):
 AsyncStreamCommands = StreamCommands
 
 
+def _zset_nonatomic_inputs(
+    keys: Iterable[KeyT] | Mapping[AnyKeyT, float],
+) -> list[tuple[AnyKeyT, float]]:
+    """
+    Normalize the ``keys`` argument of the client-side sorted set
+    aggregation commands into a list of ``(key, weight)`` pairs.
+
+    A mapping is interpreted as ``{key: weight}``, any other sequence
+    gives every key weight 1. Duplicate keys are preserved, matching the
+    server behavior of passing the same input key more than once.
+    """
+    if isinstance(keys, Mapping):
+        pairs = list(keys.items())
+    else:
+        pairs = [(key, 1) for key in keys]
+    if not pairs:
+        raise DataError("At least one input key must be specified")
+    return pairs
+
+
+def _zset_nonatomic_aggregate(aggregate: str | None) -> str:
+    if aggregate is None:
+        return "SUM"
+    normalized = aggregate.upper()
+    if normalized not in ("SUM", "MIN", "MAX"):
+        raise DataError("aggregate can be sum, min or max.")
+    return normalized
+
+
+def _zset_nonatomic_merge(
+    sets: list[list[tuple[bytes, float]]],
+    weights: list[float],
+    aggregate: str,
+    intersect: bool,
+) -> dict[bytes, float]:
+    """
+    Merge sorted sets read client-side into a single ``{member: score}``
+    mapping keyed by the encoded member bytes.
+
+    The score of a member is its weight-adjusted score in the first set
+    that contains it, combined with the weight-adjusted scores from the
+    other sets through ``aggregate`` (``SUM``, ``MIN`` or ``MAX``),
+    matching the server-side aggregation - including resetting a NaN
+    running sum (e.g. inf + -inf) to 0. With ``intersect=True`` only
+    members present in every set are kept.
+    """
+    merged: dict[bytes, float] = {}
+    iterator = iter(zip(sets, weights))
+    first_members, first_weight = next(iterator)
+    for member, score in first_members:
+        merged[member] = score * first_weight
+    for members, weight in iterator:
+        if intersect and not merged:
+            break
+        present = set()
+        for member, score in members:
+            weighted = score * weight
+            current = merged.get(member)
+            if current is None:
+                if not intersect:
+                    merged[member] = weighted
+                continue
+            present.add(member)
+            if aggregate == "SUM":
+                new_score = current + weighted
+                merged[member] = 0.0 if math.isnan(new_score) else new_score
+            elif aggregate == "MIN":
+                if weighted < current:
+                    merged[member] = weighted
+            else:  # MAX
+                if weighted > current:
+                    merged[member] = weighted
+        if intersect:
+            merged = {
+                member: score for member, score in merged.items() if member in present
+            }
+    return merged
+
+
+def _zset_nonatomic_diff(
+    sets: list[list[tuple[bytes, float]]],
+) -> dict[bytes, float]:
+    """
+    Compute the client-side difference of sorted sets read client-side:
+    the members of the first set, with their scores, that do not appear
+    in any of the other sets.
+    """
+    merged = dict(sets[0])
+    for members in sets[1:]:
+        if not merged:
+            break
+        for member, _ in members:
+            merged.pop(member, None)
+    return merged
+
+
+def _zset_nonatomic_result(
+    merged: dict[bytes, float],
+    withscores: bool,
+    score_cast_func: type | Callable,
+    encoder: "Encoder",
+) -> ZSetRangeResponse:
+    """
+    Shape a merged ``{member: score}`` mapping into the command result:
+    members ordered by score, then by their encoded bytes, optionally
+    paired with the score cast through ``score_cast_func``.
+    """
+    ordered = sorted(merged.items(), key=lambda item: (item[1], item[0]))
+    if withscores:
+        return [
+            (encoder.decode(member), score_cast_func(score))
+            for member, score in ordered
+        ]
+    return [encoder.decode(member) for member, score in ordered]
+
+
 class SortedSetCommands(CommandsProtocol):
     """
     Redis commands for Sorted Sets data type.
@@ -8451,6 +8569,44 @@ class SortedSetCommands(CommandsProtocol):
         pieces = [len(keys), *keys]
         return self.execute_command("ZDIFFSTORE", dest, *pieces)
 
+    def zdiff_nonatomic(
+        self, keys: KeysT, withscores: bool = False
+    ) -> ZSetRangeResponse:
+        """
+        Return the difference between the first and all successive input
+        sorted sets provided in ``keys``, computed client-side instead of
+        server-side like ``zdiff``.
+
+        Each key is read independently with a ``ZRANGE`` command, so the
+        operation is not atomic: if the sorted sets are modified while
+        the reads are in progress, the result is the difference of the
+        data actually returned by each individual read, which may never
+        have existed as a single snapshot. Since every key is read on its
+        own, the keys may live in different hash slots of a Redis Cluster,
+        where ``ZDIFF`` cannot run server-side.
+
+        Member identity is determined by the encoded bytes of each
+        member. The result is ordered by score, then by the encoded bytes
+        of the member for members with equal scores. With
+        ``withscores=True`` a list of ``(member, score)`` tuples is
+        returned.
+
+        For more information, see https://redis.io/commands/zdiff
+        """
+        from redis.client import NEVER_DECODE
+
+        pairs = _zset_nonatomic_inputs(keys)
+        encoder = self.get_encoder()
+        options = {"withscores": True, NEVER_DECODE: True}
+        sets = [
+            self.execute_command(
+                "ZRANGE", key, 0, -1, "WITHSCORES", keys=[key], **options
+            )
+            for key, _ in pairs
+        ]
+        merged = _zset_nonatomic_diff(sets)
+        return _zset_nonatomic_result(merged, withscores, float, encoder)
+
     @overload
     def zincrby(
         self: SyncClientProtocol, name: KeyT, amount: float, value: EncodableT
@@ -8565,6 +8721,56 @@ class SortedSetCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/zinterstore
         """
         return self._zaggregate("ZINTERSTORE", dest, keys, aggregate)
+
+    def zinter_nonatomic(
+        self,
+        keys: Sequence[KeyT] | Mapping[AnyKeyT, float],
+        aggregate: str | None = None,
+        withscores: bool = False,
+    ) -> ZSetRangeResponse:
+        """
+        Return the intersection of multiple sorted sets specified by
+        ``keys``, computed client-side instead of server-side like
+        ``zinter``.
+
+        Each key is read independently with a ``ZRANGE`` command, so the
+        operation is not atomic: if the sorted sets are modified while
+        the reads are in progress, the result is the intersection of the
+        data actually returned by each individual read, which may never
+        have existed as a single snapshot. Since every key is read on its
+        own, the keys may live in different hash slots of a Redis
+        Cluster, where ``ZINTER`` cannot run server-side.
+
+        ``keys`` can be provided as a sequence of keys, or as a
+        dictionary of keys and their weights. Member identity is
+        determined by the encoded bytes of each member, and scores are
+        aggregated based on ``aggregate`` (``SUM`` by default, ``MIN``
+        and ``MAX`` are also supported), mirroring the server-side
+        ``ZINTER`` semantics, including negative weights and infinite
+        scores.
+
+        The result is ordered by score, then by the encoded bytes of the
+        member for members with equal scores. With ``withscores=True`` a
+        list of ``(member, score)`` tuples is returned.
+
+        For more information, see https://redis.io/commands/zinter
+        """
+        from redis.client import NEVER_DECODE
+
+        pairs = _zset_nonatomic_inputs(keys)
+        aggregate = _zset_nonatomic_aggregate(aggregate)
+        encoder = self.get_encoder()
+        options = {"withscores": True, NEVER_DECODE: True}
+        sets = [
+            self.execute_command(
+                "ZRANGE", key, 0, -1, "WITHSCORES", keys=[key], **options
+            )
+            for key, _ in pairs
+        ]
+        merged = _zset_nonatomic_merge(
+            sets, [weight for _, weight in pairs], aggregate, intersect=True
+        )
+        return _zset_nonatomic_result(merged, withscores, float, encoder)
 
     @overload
     def zintercard(
@@ -9623,6 +9829,57 @@ class SortedSetCommands(CommandsProtocol):
         """
         return self._zaggregate("ZUNIONSTORE", dest, keys, aggregate)
 
+    def zunion_nonatomic(
+        self,
+        keys: Sequence[KeyT] | Mapping[AnyKeyT, float],
+        aggregate: str | None = None,
+        withscores: bool = False,
+        score_cast_func: type | Callable = float,
+    ) -> ZSetRangeResponse:
+        """
+        Return the union of multiple sorted sets specified by ``keys``,
+        computed client-side instead of server-side like ``zunion``.
+
+        Each key is read independently with a ``ZRANGE`` command, so the
+        operation is not atomic: if the sorted sets are modified while
+        the reads are in progress, the result is the union of the data
+        actually returned by each individual read, which may never have
+        existed as a single snapshot. Since every key is read on its own,
+        the keys may live in different hash slots of a Redis Cluster,
+        where ``ZUNION`` cannot run server-side.
+
+        ``keys`` can be provided as a sequence of keys, or as a
+        dictionary of keys and their weights. Member identity is
+        determined by the encoded bytes of each member, and scores are
+        aggregated based on ``aggregate`` (``SUM`` by default, ``MIN``
+        and ``MAX`` are also supported), mirroring the server-side
+        ``ZUNION`` semantics, including negative weights and infinite
+        scores.
+
+        The result is ordered by score, then by the encoded bytes of the
+        member for members with equal scores. With ``withscores=True`` a
+        list of ``(member, score)`` tuples is returned, with each score
+        cast through ``score_cast_func``.
+
+        For more information, see https://redis.io/commands/zunion
+        """
+        from redis.client import NEVER_DECODE
+
+        pairs = _zset_nonatomic_inputs(keys)
+        aggregate = _zset_nonatomic_aggregate(aggregate)
+        encoder = self.get_encoder()
+        options = {"withscores": True, NEVER_DECODE: True}
+        sets = [
+            self.execute_command(
+                "ZRANGE", key, 0, -1, "WITHSCORES", keys=[key], **options
+            )
+            for key, _ in pairs
+        ]
+        merged = _zset_nonatomic_merge(
+            sets, [weight for _, weight in pairs], aggregate, intersect=False
+        )
+        return _zset_nonatomic_result(merged, withscores, score_cast_func, encoder)
+
     @overload
     def zmscore(
         self: SyncClientProtocol, key: KeyT, members: List[str]
@@ -9683,7 +9940,150 @@ class SortedSetCommands(CommandsProtocol):
         return self.execute_command(*pieces, **options)
 
 
-AsyncSortedSetCommands = SortedSetCommands
+class AsyncSortedSetCommands(SortedSetCommands):
+    """
+    Async variants of the sorted set commands that compose multiple
+    client-side reads and therefore need to await them.
+    """
+
+    async def zdiff_nonatomic(
+        self, keys: KeysT, withscores: bool = False
+    ) -> ZSetRangeResponse:
+        """
+        Return the difference between the first and all successive input
+        sorted sets provided in ``keys``, computed client-side instead of
+        server-side like ``zdiff``.
+
+        Each key is read independently with a ``ZRANGE`` command, so the
+        operation is not atomic: if the sorted sets are modified while
+        the reads are in progress, the result is the difference of the
+        data actually returned by each individual read, which may never
+        have existed as a single snapshot. Since every key is read on its
+        own, the keys may live in different hash slots of a Redis Cluster,
+        where ``ZDIFF`` cannot run server-side.
+
+        Member identity is determined by the encoded bytes of each
+        member. The result is ordered by score, then by the encoded bytes
+        of the member for members with equal scores. With
+        ``withscores=True`` a list of ``(member, score)`` tuples is
+        returned.
+
+        For more information, see https://redis.io/commands/zdiff
+        """
+        from redis.client import NEVER_DECODE
+
+        pairs = _zset_nonatomic_inputs(keys)
+        encoder = self.get_encoder()
+        options = {"withscores": True, NEVER_DECODE: True}
+        sets = [
+            await self.execute_command(
+                "ZRANGE", key, 0, -1, "WITHSCORES", keys=[key], **options
+            )
+            for key, _ in pairs
+        ]
+        merged = _zset_nonatomic_diff(sets)
+        return _zset_nonatomic_result(merged, withscores, float, encoder)
+
+    async def zinter_nonatomic(
+        self,
+        keys: Sequence[KeyT] | Mapping[AnyKeyT, float],
+        aggregate: str | None = None,
+        withscores: bool = False,
+    ) -> ZSetRangeResponse:
+        """
+        Return the intersection of multiple sorted sets specified by
+        ``keys``, computed client-side instead of server-side like
+        ``zinter``.
+
+        Each key is read independently with a ``ZRANGE`` command, so the
+        operation is not atomic: if the sorted sets are modified while
+        the reads are in progress, the result is the intersection of the
+        data actually returned by each individual read, which may never
+        have existed as a single snapshot. Since every key is read on its
+        own, the keys may live in different hash slots of a Redis
+        Cluster, where ``ZINTER`` cannot run server-side.
+
+        ``keys`` can be provided as a sequence of keys, or as a
+        dictionary of keys and their weights. Member identity is
+        determined by the encoded bytes of each member, and scores are
+        aggregated based on ``aggregate`` (``SUM`` by default, ``MIN``
+        and ``MAX`` are also supported), mirroring the server-side
+        ``ZINTER`` semantics, including negative weights and infinite
+        scores.
+
+        The result is ordered by score, then by the encoded bytes of the
+        member for members with equal scores. With ``withscores=True`` a
+        list of ``(member, score)`` tuples is returned.
+
+        For more information, see https://redis.io/commands/zinter
+        """
+        from redis.client import NEVER_DECODE
+
+        pairs = _zset_nonatomic_inputs(keys)
+        aggregate = _zset_nonatomic_aggregate(aggregate)
+        encoder = self.get_encoder()
+        options = {"withscores": True, NEVER_DECODE: True}
+        sets = [
+            await self.execute_command(
+                "ZRANGE", key, 0, -1, "WITHSCORES", keys=[key], **options
+            )
+            for key, _ in pairs
+        ]
+        merged = _zset_nonatomic_merge(
+            sets, [weight for _, weight in pairs], aggregate, intersect=True
+        )
+        return _zset_nonatomic_result(merged, withscores, float, encoder)
+
+    async def zunion_nonatomic(
+        self,
+        keys: Sequence[KeyT] | Mapping[AnyKeyT, float],
+        aggregate: str | None = None,
+        withscores: bool = False,
+        score_cast_func: type | Callable = float,
+    ) -> ZSetRangeResponse:
+        """
+        Return the union of multiple sorted sets specified by ``keys``,
+        computed client-side instead of server-side like ``zunion``.
+
+        Each key is read independently with a ``ZRANGE`` command, so the
+        operation is not atomic: if the sorted sets are modified while
+        the reads are in progress, the result is the union of the data
+        actually returned by each individual read, which may never have
+        existed as a single snapshot. Since every key is read on its own,
+        the keys may live in different hash slots of a Redis Cluster,
+        where ``ZUNION`` cannot run server-side.
+
+        ``keys`` can be provided as a sequence of keys, or as a
+        dictionary of keys and their weights. Member identity is
+        determined by the encoded bytes of each member, and scores are
+        aggregated based on ``aggregate`` (``SUM`` by default, ``MIN``
+        and ``MAX`` are also supported), mirroring the server-side
+        ``ZUNION`` semantics, including negative weights and infinite
+        scores.
+
+        The result is ordered by score, then by the encoded bytes of the
+        member for members with equal scores. With ``withscores=True`` a
+        list of ``(member, score)`` tuples is returned, with each score
+        cast through ``score_cast_func``.
+
+        For more information, see https://redis.io/commands/zunion
+        """
+        from redis.client import NEVER_DECODE
+
+        pairs = _zset_nonatomic_inputs(keys)
+        aggregate = _zset_nonatomic_aggregate(aggregate)
+        encoder = self.get_encoder()
+        options = {"withscores": True, NEVER_DECODE: True}
+        sets = [
+            await self.execute_command(
+                "ZRANGE", key, 0, -1, "WITHSCORES", keys=[key], **options
+            )
+            for key, _ in pairs
+        ]
+        merged = _zset_nonatomic_merge(
+            sets, [weight for _, weight in pairs], aggregate, intersect=False
+        )
+        return _zset_nonatomic_result(merged, withscores, score_cast_func, encoder)
 
 
 class HyperlogCommands(CommandsProtocol):
