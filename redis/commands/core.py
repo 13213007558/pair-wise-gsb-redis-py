@@ -37,6 +37,7 @@ from redis.asyncio.observability.recorder import (
     record_streaming_lag_from_response as async_record_streaming_lag,
 )
 from redis.exceptions import ConnectionError, DataError, NoScriptError, RedisError
+from redis.geo_polygon import GeoPolygon, candidate_counts, filter_rows
 from redis.himport import (
     HIMPORT_DISCARD,
     HIMPORT_DISCARDALL,
@@ -12134,8 +12135,134 @@ class GeoCommands(CommandsProtocol):
 
         return self.execute_command(command, *pieces, **kwargs)
 
+    def geosearch_polygon(
+        self,
+        name: KeyT,
+        polygon: Sequence[Tuple[float, float]],
+        holes: Sequence[Sequence[Tuple[float, float]]] | None = None,
+        unit: str = "m",
+        count: int | None = None,
+        sort: str | None = None,
+        withcoord: bool = False,
+        withdist: bool = False,
+        withhash: bool = False,
+    ) -> GeoSearchResponse:
+        """
+        Return the members of `name` whose positions are inside
+        `polygon`, filtering GEOSEARCH candidates client-side.
 
-AsyncGeoCommands = GeoCommands
+        `polygon` is the outer ring, a sequence of `(longitude,
+        latitude)` pairs. `holes` is an optional sequence of rings to
+        exclude. Rings may cross the +-180 meridian. A point lying exactly
+        on a ring boundary is considered part of that ring: points on the
+        outer boundary match, points on a hole boundary are excluded.
+        Self-intersecting rings and coordinates outside the valid Redis
+        ranges are rejected with `DataError` before any command is sent.
+
+        The server query is narrowed to the polygon's bounding box
+        (GEOSEARCH ... BYBOX) and candidates are filtered client-side with
+        exact geometry. When `count` is given, the COUNT sent to the
+        server is repeatedly doubled until `count` matches survive
+        filtering or the bounding box is exhausted, so members inside
+        holes never consume the limit.
+
+        `unit`, `sort`, `withcoord`, `withdist` and `withhash`
+        behave like in `geosearch`; distances and ordering always come
+        from the values returned by the server.
+        """
+        shape = GeoPolygon(polygon, holes)
+        if count is not None and count < 1:
+            raise DataError("GEOSEARCH polygon count must be a positive integer")
+        longitude, latitude, width, height = shape.bounding_box(unit)
+        if count is None:
+            rows = self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                width=width,
+                height=height,
+                unit=unit,
+                sort=sort,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            return filter_rows(shape, rows, withcoord, withdist, withhash)
+        for candidate_count in candidate_counts(count):
+            rows = self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                width=width,
+                height=height,
+                unit=unit,
+                sort=sort,
+                count=candidate_count,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            matched = filter_rows(shape, rows, withcoord, withdist, withhash)
+            if len(matched) >= count:
+                return matched[:count]
+            if len(rows) < candidate_count:
+                return matched
+
+
+class AsyncGeoCommands(GeoCommands):
+    async def geosearch_polygon(
+        self,
+        name: KeyT,
+        polygon: Sequence[Tuple[float, float]],
+        holes: Sequence[Sequence[Tuple[float, float]]] | None = None,
+        unit: str = "m",
+        count: int | None = None,
+        sort: str | None = None,
+        withcoord: bool = False,
+        withdist: bool = False,
+        withhash: bool = False,
+    ) -> GeoSearchResponse:
+        """
+        Asynchronous version of `geosearch_polygon`; see the synchronous
+        implementation on `GeoCommands` for the full documentation.
+        """
+        shape = GeoPolygon(polygon, holes)
+        if count is not None and count < 1:
+            raise DataError("GEOSEARCH polygon count must be a positive integer")
+        longitude, latitude, width, height = shape.bounding_box(unit)
+        if count is None:
+            rows = await self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                width=width,
+                height=height,
+                unit=unit,
+                sort=sort,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            return filter_rows(shape, rows, withcoord, withdist, withhash)
+        for candidate_count in candidate_counts(count):
+            rows = await self.geosearch(
+                name,
+                longitude=longitude,
+                latitude=latitude,
+                width=width,
+                height=height,
+                unit=unit,
+                sort=sort,
+                count=candidate_count,
+                withcoord=True,
+                withdist=withdist,
+                withhash=withhash,
+            )
+            matched = filter_rows(shape, rows, withcoord, withdist, withhash)
+            if len(matched) >= count:
+                return matched[:count]
+            if len(rows) < candidate_count:
+                return matched
 
 
 class ModuleCommands(CommandsProtocol):
