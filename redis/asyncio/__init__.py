@@ -20,6 +20,11 @@ from redis.asyncio.sentinel import (
 )
 from redis.asyncio.utils import from_url
 from redis.backoff import default_backoff
+from redis.commands.core import (
+    BitFieldLayout,
+    BitFieldLayoutField,
+    BitFieldWriteResult,
+)
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
@@ -45,6 +50,9 @@ __all__ = [
     "AuthenticationError",
     "AuthenticationWrongNumberOfArgsError",
     "BlockingConnectionPool",
+    "BitFieldLayout",
+    "BitFieldLayoutField",
+    "BitFieldWriteResult",
     "BusyLoadingError",
     "ChildDeadlockedError",
     "Connection",

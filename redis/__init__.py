@@ -1,6 +1,11 @@
 from redis import asyncio  # noqa
 from redis.backoff import default_backoff
 from redis.client import Redis, StrictRedis
+from redis.commands.core import (
+    BitFieldLayout,
+    BitFieldLayoutField,
+    BitFieldWriteResult,
+)
 from redis.driver_info import DriverInfo
 from redis.cluster import RedisCluster
 from redis.connection import (
@@ -73,6 +78,9 @@ __all__ = [
     "AuthenticationError",
     "AuthenticationWrongNumberOfArgsError",
     "BlockingConnectionPool",
+    "BitFieldLayout",
+    "BitFieldLayoutField",
+    "BitFieldWriteResult",
     "BusyLoadingError",
     "ChannelType",
     "ChildDeadlockedError",

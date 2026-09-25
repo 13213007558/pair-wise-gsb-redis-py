@@ -8292,6 +8292,144 @@ class TestRedisCommands:
         resp = r.bitfield_ro("a", "u8", 0, items)
         assert resp == [0, 15, 15, 14]
 
+    @skip_if_server_version_lt("6.0.0")
+    def test_bitfield_layout_records(self, r: redis.Redis):
+        layout = redis.BitFieldLayout(
+            ("signed", "i5"), 3, ("unsigned", "u11"), stride=24
+        )
+        r.delete("records")
+
+        result = layout.write(r, "records", 0, {"signed": -1, "unsigned": 2047})
+        assert result.previous == {"signed": 0, "unsigned": 0}
+        assert result.not_written == ()
+        assert r.get("records") == bytes.fromhex("f8ffe0")
+        assert layout.read(r, "records", 0) == {"signed": -1, "unsigned": 2047}
+
+        result = layout.write(r, "records", 1, {"signed": -8, "unsigned": 1365})
+        assert result.previous == {"signed": 0, "unsigned": 0}
+        assert r.get("records") == bytes.fromhex("f8ffe0c0aaa0")
+        assert layout.read(r, "records", 0) == {"signed": -1, "unsigned": 2047}
+        assert layout.read(r, "records", 1) == {"signed": -8, "unsigned": 1365}
+        assert layout.read(r, "records", 1, "signed") == {"signed": -8}
+
+    @skip_if_server_version_lt("6.0.0")
+    def test_bitfield_layout_overflow(self, r: redis.Redis):
+        r.delete("overflow-records")
+
+        layout = redis.BitFieldLayout(("signed", "i5"), 3, ("unsigned", "u11"))
+        wrapped = layout.write(
+            r,
+            "overflow-records",
+            0,
+            {"signed": 17, "unsigned": 2048},
+            overflow="WRAP",
+        )
+        assert wrapped.previous == {"signed": 0, "unsigned": 0}
+        assert wrapped.not_written == ()
+        assert layout.read(r, "overflow-records", 0) == {
+            "signed": -15,
+            "unsigned": 0,
+        }
+
+        saturated = layout.write(
+            r,
+            "overflow-records",
+            1,
+            {"signed": 100, "unsigned": 5000},
+            overflow="SAT",
+        )
+        assert saturated.previous == {"signed": 0, "unsigned": 0}
+        assert saturated.not_written == ()
+        assert layout.read(r, "overflow-records", 1) == {
+            "signed": 15,
+            "unsigned": 2047,
+        }
+
+        fail_layout = redis.BitFieldLayout(
+            ("first", "u4"), 4, ("second", "u4"), 4, ("third", "u4")
+        )
+        failed = fail_layout.write(
+            r,
+            "overflow-records",
+            2,
+            {"first": 15, "second": 16, "third": 7},
+            overflow="FAIL",
+        )
+        assert failed.previous == {"first": 0, "second": None, "third": 0}
+        assert failed.not_written == ("second",)
+        assert fail_layout.read(r, "overflow-records", 2) == {
+            "first": 15,
+            "second": 0,
+            "third": 7,
+        }
+
+    def test_bitfield_layout_validation_and_commands(self):
+        with pytest.raises(redis.DataError, match="1 through 64"):
+            redis.BitFieldLayout(("signed", "i65"))
+        with pytest.raises(redis.DataError, match="1 through 63"):
+            redis.BitFieldLayout(("unsigned", "u64"))
+        with pytest.raises(redis.DataError, match="positive integer"):
+            redis.BitFieldLayout(("invalid", "i+8"))
+        with pytest.raises(redis.DataError, match="overlaps"):
+            redis.BitFieldLayout(("first", "u8"), ("second", "u8", 4))
+        with pytest.raises(redis.DataError, match="overlaps"):
+            redis.BitFieldLayout(("first", "u8", 0), 8, ("gap", "u8", 0))
+        with pytest.raises(redis.DataError, match="overlaps"):
+            redis.BitFieldLayout(("first", "u4", 8), 4, ("second", "u4", 8))
+        with pytest.raises(redis.DataError, match="beyond the record stride"):
+            redis.BitFieldLayout(("value", "u16"), stride=15)
+
+        layout = redis.BitFieldLayout(("first", "i5"), 3, ("second", "u11"), stride=24)
+        client = redis.Redis()
+        with pytest.raises(redis.DataError, match="non-negative"):
+            layout.read(client, "records", -1)
+        with pytest.raises(redis.DataError, match="Unknown"):
+            layout.read(client, "records", 0, "missing")
+        with patch.object(client, "execute_command") as execute_command:
+            execute_command.return_value = [-1, 2047]
+            assert layout.read(client, "records", 2) == {
+                "first": -1,
+                "second": 2047,
+            }
+            execute_command.assert_called_once_with(
+                "BITFIELD_RO",
+                "records",
+                "GET",
+                "i5",
+                48,
+                "GET",
+                "u11",
+                56,
+                keys=["records"],
+            )
+
+            execute_command.reset_mock()
+            execute_command.return_value = [0, None]
+            result = layout.write(
+                client,
+                "records",
+                0,
+                {"first": -1, "second": 2048},
+                overflow="fail",
+            )
+            assert result.previous == {"first": 0, "second": None}
+            assert result.not_written == ("second",)
+            execute_command.assert_called_once_with(
+                "BITFIELD",
+                "records",
+                "OVERFLOW",
+                "FAIL",
+                "SET",
+                "i5",
+                0,
+                -1,
+                "SET",
+                "u11",
+                8,
+                2048,
+                keys=["records"],
+            )
+
     @skip_if_server_version_lt("4.0.0")
     def test_memory_help(self, r):
         with pytest.raises(NotImplementedError):

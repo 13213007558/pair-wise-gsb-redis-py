@@ -6444,6 +6444,125 @@ class TestRedisCommands:
         resp = await r.bitfield_ro("a", "u8", 0, items)
         assert resp == [0, 15, 15, 14]
 
+    @skip_if_server_version_lt("6.0.0")
+    async def test_bitfield_layout_records(self, r: redis.Redis):
+        layout = redis.BitFieldLayout(
+            ("signed", "i5"), 3, ("unsigned", "u11"), stride=24
+        )
+        await r.delete("records")
+
+        result = await layout.write(r, "records", 0, {"signed": -1, "unsigned": 2047})
+        assert result.previous == {"signed": 0, "unsigned": 0}
+        assert result.not_written == ()
+        assert await r.get("records") == bytes.fromhex("f8ffe0")
+        assert await layout.read(r, "records", 0) == {
+            "signed": -1,
+            "unsigned": 2047,
+        }
+
+        result = await layout.write(r, "records", 1, {"signed": -8, "unsigned": 1365})
+        assert result.previous == {"signed": 0, "unsigned": 0}
+        assert await r.get("records") == bytes.fromhex("f8ffe0c0aaa0")
+        assert await layout.read(r, "records", 0) == {
+            "signed": -1,
+            "unsigned": 2047,
+        }
+        assert await layout.read(r, "records", 1) == {
+            "signed": -8,
+            "unsigned": 1365,
+        }
+
+    @skip_if_server_version_lt("6.0.0")
+    async def test_bitfield_layout_overflow(self, r: redis.Redis):
+        await r.delete("overflow-records")
+        layout = redis.BitFieldLayout(("signed", "i5"), 3, ("unsigned", "u11"))
+
+        wrapped = await layout.write(
+            r,
+            "overflow-records",
+            0,
+            {"signed": 17, "unsigned": 2048},
+            overflow="WRAP",
+        )
+        assert wrapped.previous == {"signed": 0, "unsigned": 0}
+        assert wrapped.not_written == ()
+        assert await layout.read(r, "overflow-records", 0) == {
+            "signed": -15,
+            "unsigned": 0,
+        }
+
+        saturated = await layout.write(
+            r,
+            "overflow-records",
+            1,
+            {"signed": 100, "unsigned": 5000},
+            overflow="SAT",
+        )
+        assert saturated.previous == {"signed": 0, "unsigned": 0}
+        assert await layout.read(r, "overflow-records", 1) == {
+            "signed": 15,
+            "unsigned": 2047,
+        }
+
+        fail_layout = redis.BitFieldLayout(
+            ("first", "u4"), 4, ("second", "u4"), 4, ("third", "u4")
+        )
+        failed = await fail_layout.write(
+            r,
+            "overflow-records",
+            2,
+            {"first": 15, "second": 16, "third": 7},
+            overflow="FAIL",
+        )
+        assert failed.previous == {"first": 0, "second": None, "third": 0}
+        assert failed.not_written == ("second",)
+        assert await fail_layout.read(r, "overflow-records", 2) == {
+            "first": 15,
+            "second": 0,
+            "third": 7,
+        }
+
+    async def test_bitfield_layout_async_commands(self):
+        layout = redis.BitFieldLayout(("first", "i5"), 3, ("second", "u11"), stride=24)
+        client = redis.Redis()
+        try:
+            with patch.object(
+                client, "execute_command", new_callable=AsyncMock
+            ) as execute_command:
+                execute_command.return_value = [-1, 2047]
+                assert await layout.read(client, "records", 2) == {
+                    "first": -1,
+                    "second": 2047,
+                }
+                execute_command.assert_awaited_once_with(
+                    "BITFIELD_RO",
+                    "records",
+                    "GET",
+                    "i5",
+                    48,
+                    "GET",
+                    "u11",
+                    56,
+                    keys=["records"],
+                )
+
+                execute_command.reset_mock()
+                execute_command.return_value = [0, None]
+                result = await layout.write(
+                    client,
+                    "records",
+                    0,
+                    {"first": -1, "second": 2048},
+                    overflow="fail",
+                )
+                assert result.previous == {"first": 0, "second": None}
+                assert result.not_written == ("second",)
+                execute_command.assert_awaited_once()
+                assert execute_command.await_args.args[0] == "BITFIELD"
+                assert "OVERFLOW" in execute_command.await_args.args
+        finally:
+            await client.aclose()
+
     @skip_if_server_version_lt("4.0.0")
     async def test_memory_stats(self, r: redis.Redis):
         # put a key into the current db to make sure that "db.<current-db>"

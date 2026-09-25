@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import inspect
+from dataclasses import dataclass
 
 # Try to import the xxhash library as an optional dependency
 try:
@@ -2644,6 +2645,294 @@ class BitFieldOperation:
         command = self.command
         self.reset()
         return self.client.execute_command(*command)
+
+
+@dataclass(frozen=True, slots=True)
+class BitFieldLayoutField:
+    """A compiled field entry in a :class:`BitFieldLayout` record."""
+
+    name: str
+    encoding: str
+    signed: bool
+    width: int
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class BitFieldWriteResult:
+    """
+    Result of a BITFIELD layout write.
+
+    ``previous`` contains the value of each field before its SET operation.
+    ``not_written`` names fields rejected by the FAIL overflow algorithm. BITFIELD
+    is not a transaction, so fields before and after a rejected SET can still be
+    written.
+    """
+
+    previous: dict[str, int | None]
+    not_written: tuple[str, ...]
+
+
+class BitFieldLayout:
+    """
+    A reusable fixed-width BITFIELD record layout.
+
+    Fields are declared in declaration order. Each field is either a
+    ``(name, encoding)`` or ``(name, encoding, offset)`` tuple; a positive
+    integer declaration inserts an explicit gap of that many bits. Encoding is
+    Redis BITFIELD notation, ``i`` for signed and ``u`` for unsigned fields.
+    Reads use ``BITFIELD_RO`` and therefore require Redis 6.0 or newer.
+
+    >>> layout = BitFieldLayout(("small", "i5"), 3, ("large", "u11"), stride=24)
+    >>> layout.write(client, "records", 0, {"small": -1, "large": 2047})
+    """
+
+    def __init__(
+        self,
+        *declarations: tuple[str, str] | tuple[str, str, int] | list | int,
+        stride: int | None = None,
+    ):
+        fields: list[BitFieldLayoutField] = []
+        names: set[str] = set()
+        occupied_ranges: list[tuple[int, int]] = []
+        cursor = 0
+
+        for declaration in declarations:
+            if isinstance(declaration, int) and not isinstance(declaration, bool):
+                if declaration < 0:
+                    raise DataError("BitField layout gaps cannot be negative")
+                occupied_ranges.append((cursor, cursor + declaration))
+                cursor += declaration
+                continue
+
+            if not isinstance(declaration, (tuple, list)) or len(declaration) not in (
+                2,
+                3,
+            ):
+                raise DataError(
+                    "BitField layout fields must be (name, encoding) or "
+                    "(name, encoding, offset) tuples"
+                )
+
+            name, encoding = declaration[:2]
+            explicit_offset = declaration[2] if len(declaration) == 3 else None
+            if not isinstance(name, str) or not name:
+                raise DataError("BitField layout field names must be non-empty strings")
+            if name in names:
+                raise DataError(f"Duplicate BitField layout field name: {name!r}")
+
+            signed, width = self._parse_encoding(encoding)
+            if explicit_offset is None:
+                offset = cursor
+            else:
+                if not isinstance(explicit_offset, int) or isinstance(
+                    explicit_offset, bool
+                ):
+                    raise DataError("BitField layout offsets must be integers")
+                if explicit_offset < 0:
+                    raise DataError("BitField layout offsets cannot be negative")
+                offset = explicit_offset
+
+            field_end = offset + width
+            if any(
+                offset < end and start < field_end for start, end in occupied_ranges
+            ):
+                raise DataError(
+                    f"BitField layout field {name!r} overlaps a preceding field or gap"
+                )
+
+            occupied_ranges.append((offset, field_end))
+
+            names.add(name)
+            fields.append(
+                BitFieldLayoutField(
+                    name=name,
+                    encoding=encoding.lower(),
+                    signed=signed,
+                    width=width,
+                    offset=offset,
+                )
+            )
+            cursor = max(cursor, field_end)
+
+        if not fields:
+            raise DataError("BitField layout must declare at least one field")
+        if stride is None:
+            stride = cursor
+        if not isinstance(stride, int) or isinstance(stride, bool) or stride <= 0:
+            raise DataError("BitField layout stride must be a positive integer")
+        if cursor > stride:
+            raise DataError("BitField layout fields extend beyond the record stride")
+
+        self.fields: tuple[BitFieldLayoutField, ...] = tuple(fields)
+        self.stride = stride
+        self._fields_by_name = {field.name: field for field in self.fields}
+
+    @staticmethod
+    def _parse_encoding(encoding: str) -> tuple[bool, int]:
+        if not isinstance(encoding, str) or len(encoding) < 2:
+            raise DataError("BitField encoding must be a string such as 'i8' or 'u8'")
+        sign = encoding[0].lower()
+        if sign not in ("i", "u"):
+            raise DataError("BitField encoding must begin with 'i' or 'u'")
+        width_text = encoding[1:]
+        if not width_text.isdigit():
+            raise DataError("BitField encoding width must be a positive integer")
+        width = int(width_text)
+        maximum_width = 64 if sign == "i" else 63
+        if width < 1 or width > maximum_width:
+            if sign == "i":
+                supported_widths = "1 through 64"
+            else:
+                supported_widths = "1 through 63"
+            raise DataError(
+                f"Redis BITFIELD {encoding[0].upper()} fields support widths {supported_widths}"
+            )
+        return sign == "i", width
+
+    def _record_base(self, record: int) -> int:
+        if not isinstance(record, int) or isinstance(record, bool) or record < 0:
+            raise DataError(
+                "BitField layout record numbers must be non-negative integers"
+            )
+        return record * self.stride
+
+    def _selected_fields(
+        self, field_names: str | Sequence[str] | None
+    ) -> tuple[BitFieldLayoutField, ...]:
+        if field_names is None:
+            return self.fields
+        if isinstance(field_names, str):
+            names = (field_names,)
+        else:
+            names = tuple(field_names)
+        if not names:
+            raise DataError("At least one BitField layout field is required")
+        if len(names) != len(set(names)):
+            raise DataError("BitField layout field names must not be repeated")
+        try:
+            return tuple(self._fields_by_name[name] for name in names)
+        except KeyError as error:
+            raise DataError(
+                f"Unknown BitField layout field: {error.args[0]!r}"
+            ) from None
+
+    @overload
+    def read(
+        self: "BitFieldLayout",
+        client: SyncClientProtocol,
+        key: KeyT,
+        record: int,
+        fields: str | Sequence[str] | None = None,
+    ) -> dict[str, int]: ...
+
+    @overload
+    def read(
+        self: "BitFieldLayout",
+        client: AsyncClientProtocol,
+        key: KeyT,
+        record: int,
+        fields: str | Sequence[str] | None = None,
+    ) -> Awaitable[dict[str, int]]: ...
+
+    def read(
+        self,
+        client: Union["redis.client.Redis", "redis.asyncio.client.Redis"],
+        key: KeyT,
+        record: int,
+        fields: str | Sequence[str] | None = None,
+    ) -> dict[str, int] | Awaitable[dict[str, int]]:
+        """Read named fields from one fixed-width record."""
+        selected_fields = self._selected_fields(fields)
+        base = self._record_base(record)
+        params: list[EncodableT] = [key]
+        for field in selected_fields:
+            params.extend(["GET", field.encoding, base + field.offset])
+
+        response = client.execute_command("BITFIELD_RO", *params, keys=[key])
+        if inspect.isawaitable(response):
+
+            async def read_async():
+                values = await response
+                return {
+                    field.name: value
+                    for field, value in zip(selected_fields, values, strict=True)
+                }
+
+            return read_async()
+        return {
+            field.name: value
+            for field, value in zip(selected_fields, response, strict=True)
+        }
+
+    @overload
+    def write(
+        self: "BitFieldLayout",
+        client: SyncClientProtocol,
+        key: KeyT,
+        record: int,
+        values: Mapping[str, int],
+        overflow: Literal["WRAP", "SAT", "FAIL"] = "WRAP",
+    ) -> BitFieldWriteResult: ...
+
+    @overload
+    def write(
+        self: "BitFieldLayout",
+        client: AsyncClientProtocol,
+        key: KeyT,
+        record: int,
+        values: Mapping[str, int],
+        overflow: Literal["WRAP", "SAT", "FAIL"] = "WRAP",
+    ) -> Awaitable[BitFieldWriteResult]: ...
+
+    def write(
+        self,
+        client: Union["redis.client.Redis", "redis.asyncio.client.Redis"],
+        key: KeyT,
+        record: int,
+        values: Mapping[str, int],
+        overflow: Literal["WRAP", "SAT", "FAIL"] = "WRAP",
+    ) -> BitFieldWriteResult | Awaitable[BitFieldWriteResult]:
+        """Write named fields to one fixed-width record."""
+        overflow = overflow.upper()
+        if overflow not in ("WRAP", "SAT", "FAIL"):
+            raise DataError("BitField overflow must be one of WRAP, SAT, or FAIL")
+        if not isinstance(values, Mapping):
+            raise DataError("BitField layout values must be a mapping of field names")
+
+        selected_fields = self._selected_fields(tuple(values.keys()))
+        base = self._record_base(record)
+        params: list[EncodableT] = [key, "OVERFLOW", overflow]
+        for field, value in zip(selected_fields, values.values(), strict=True):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise DataError(
+                    f"BitField layout field {field.name!r} must be an integer"
+                )
+            params.extend(["SET", field.encoding, base + field.offset, value])
+
+        response = client.execute_command("BITFIELD", *params, keys=[key])
+        if inspect.isawaitable(response):
+
+            async def write_async():
+                previous_values = await response
+                return self._build_write_result(selected_fields, previous_values)
+
+            return write_async()
+        return self._build_write_result(selected_fields, response)
+
+    @staticmethod
+    def _build_write_result(
+        fields: tuple[BitFieldLayoutField, ...], response: Sequence[int | None]
+    ) -> BitFieldWriteResult:
+        previous = {
+            field.name: value for field, value in zip(fields, response, strict=True)
+        }
+        not_written = tuple(
+            field.name
+            for field, value in zip(fields, response, strict=True)
+            if value is None
+        )
+        return BitFieldWriteResult(previous=previous, not_written=not_written)
 
 
 class DataPersistOptions(Enum):
