@@ -841,10 +841,12 @@ class RedisCluster(
             the `movablekeys` reads - `ZINTER`, `ZUNION`, `ZDIFF`, `ZINTERCARD`, `SINTERCARD`,
             `XREAD` - report their keys only in their key specs, so the live reply yields
             keyless policies that send them to an arbitrary node rather than the one holding
-            their keys; the shipped records withhold those policies instead, which is what
-            leaves the client to resolve the keys through `COMMAND GETKEYS`. So pair such a
-            resolver with an explicit `policy_resolver=StaticPolicyResolver()` to keep routing
-            on the shipped records.
+            their keys; the shipped records withhold those policies instead, which is
+            what leaves the client to resolve the keys itself - locally, from the key
+            specifications, or through `COMMAND GETKEYS` when they do not suffice. So
+            pair such a resolver with an explicit
+            `policy_resolver=StaticPolicyResolver()` to keep routing on the shipped
+            records.
         :param maint_notifications_config:
             Configures the nodes connections to support maintenance notifications - see
             `redis.maint_notifications.MaintNotificationsConfig` for details.

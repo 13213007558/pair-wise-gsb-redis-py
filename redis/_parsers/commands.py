@@ -3,9 +3,11 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     Iterator,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     TypeVar,
@@ -83,8 +85,10 @@ class CommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
     COMMAND output is used to determine key locations.
     Commands that do not have a predefined key location are flagged with
-    'movablekeys', and these commands' keys are determined by the command
-    'COMMAND GETKEYS'.
+    'movablekeys', and these commands' keys are extracted locally from their
+    key specifications when the server reports them (Redis 7.0+); commands
+    whose key specifications are incomplete or missing still have their keys
+    determined by the command 'COMMAND GETKEYS'.
     """
 
     def __init__(self, redis_connection):
@@ -108,6 +112,10 @@ class CommandsParser(AbstractCommandsParser):
     def get_keys(self, redis_conn, *args):
         """
         Get the keys from the passed command.
+
+        Keys of 'movablekeys' commands are extracted locally from the command's
+        key specifications when they are complete, falling back to
+        'COMMAND GETKEYS' otherwise.
 
         NOTE: Due to a bug in redis<7.0, this function does not work properly
         for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -139,8 +147,23 @@ class CommandsParser(AbstractCommandsParser):
                     )
 
         command = self.commands.get(cmd_name)
-        if "movablekeys" in command["flags"]:
-            keys = self._get_moveable_keys(redis_conn, *args)
+        # A container subcommand carries its own flags and key specifications, so
+        # resolve it before deciding how the keys are found.
+        effective_command = command
+        if len(args) > 1 and command.get("subcommands"):
+            subcmd_name = f"{cmd_name}|{args[1].lower()}"
+            for subcmd in command["subcommands"]:
+                if str_if_bytes(subcmd[0]) == subcmd_name:
+                    effective_command = self.parse_subcommand(subcmd)
+                    break
+        if "movablekeys" in effective_command["flags"]:
+            extracted = _extract_keys_from_specs(effective_command, args)
+            if extracted is not None:
+                # Arguments flagged not_key (e.g. a shard pubsub channel) are not
+                # key names and must not decide the slot.
+                keys = [key for key, flags in extracted if "not_key" not in flags]
+            else:
+                keys = self._get_moveable_keys(redis_conn, *args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -256,7 +279,9 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
     COMMAND output is used to determine key locations.
     Commands that do not have a predefined key location are flagged with 'movablekeys',
-    and these commands' keys are determined by the command 'COMMAND GETKEYS'.
+    and these commands' keys are extracted locally from their key specifications when
+    the server reports them (Redis 7.0+); commands whose key specifications are
+    incomplete or missing still have their keys determined by 'COMMAND GETKEYS'.
 
     NOTE: Due to a bug in redis<7.0, this does not work properly
     for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -284,6 +309,10 @@ class AsyncCommandsParser(AbstractCommandsParser):
     async def get_keys(self, *args: Any) -> Optional[Tuple[str, ...]]:
         """
         Get the keys from the passed command.
+
+        Keys of 'movablekeys' commands are extracted locally from the command's
+        key specifications when they are complete, falling back to
+        'COMMAND GETKEYS' otherwise.
 
         NOTE: Due to a bug in redis<7.0, this function does not work properly
         for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -315,8 +344,23 @@ class AsyncCommandsParser(AbstractCommandsParser):
                     )
 
         command = self.commands.get(cmd_name)
-        if "movablekeys" in command["flags"]:
-            keys = await self._get_moveable_keys(*args)
+        # A container subcommand carries its own flags and key specifications, so
+        # resolve it before deciding how the keys are found.
+        effective_command = command
+        if len(args) > 1 and command.get("subcommands"):
+            subcmd_name = f"{cmd_name}|{args[1].lower()}"
+            for subcmd in command["subcommands"]:
+                if str_if_bytes(subcmd[0]) == subcmd_name:
+                    effective_command = self.parse_subcommand(subcmd)
+                    break
+        if "movablekeys" in effective_command["flags"]:
+            extracted = _extract_keys_from_specs(effective_command, args)
+            if extracted is not None:
+                # Arguments flagged not_key (e.g. a shard pubsub channel) are not
+                # key names and must not decide the slot.
+                keys = [key for key, flags in extracted if "not_key" not in flags]
+            else:
+                keys = await self._get_moveable_keys(*args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -805,3 +849,259 @@ def _build_commands_metadata_cache(
         IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
     """
     return _build_command_records(commands, _to_command_metadata)
+
+
+# =============================================================================
+# Local key extraction from key specifications
+# =============================================================================
+# Redis 7 key specifications describe where a command's key name arguments sit, which
+# makes the keys of most ``movablekeys`` commands computable on the client, without the
+# ``COMMAND GETKEYS`` round trip. The extraction below mirrors the server's
+# ``getKeysUsingKeySpec``: ``begin_search`` finds where the keys start (a fixed ``index``
+# or the argument after a ``keyword``), and ``find_keys`` finds where they end (a
+# ``range`` or a ``keynum`` counter). Anything the specs do not fully describe - an
+# ``unknown`` begin_search/find_keys, an ``incomplete`` spec flag, a shape this client
+# does not implement - makes the whole extraction return None, and the caller falls back
+# to ``COMMAND GETKEYS``: a command routed by keys that were guessed wrong would reach
+# an arbitrary node.
+
+# Maps only ASCII upper case to lower case, which is the case folding the server's
+# ``strcasecmp`` applies to key-spec keywords. ``str.lower`` would also fold non-ASCII
+# letters, matching arguments the server would not.
+_ASCII_LOWER_TABLE = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def _spec_fields(raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize a key-specification fragment to a string-keyed dict.
+
+    RESP3 reports key specs as maps and RESP2 as flat ``[name, value, ...]`` sequences,
+    so both shapes are read here. Returns None for anything else - notably the
+    ``"unknown"`` string a server reports for a spec it cannot describe.
+    """
+    if isinstance(raw, dict):
+        return {str_if_bytes(key): value for key, value in raw.items()}
+    if isinstance(raw, (list, tuple)) and len(raw) % 2 == 0:
+        return {
+            str_if_bytes(raw[index]): raw[index + 1] for index in range(0, len(raw), 2)
+        }
+    return None
+
+
+def _normalize_key_spec(
+    raw_spec: Any,
+) -> Optional[Tuple[FrozenSet[str], Tuple[str, Any], Tuple[str, Any]]]:
+    """
+    Normalize one raw key specification into ``(flags, begin_search, find_keys)``.
+
+    ``begin_search`` is ``("index", position)`` or ``("keyword", (word, startfrom))``;
+    ``find_keys`` is ``("range", (lastkey, keystep, limit))`` or
+    ``("keynum", (keynum, firstkey, keystep))``.
+
+    Returns None when the spec is flagged ``incomplete``, uses a mechanism this client
+    does not implement, or is malformed - all of which the caller treats as "resolve
+    the keys on the server instead".
+    """
+    fields = _spec_fields(raw_spec)
+    if fields is None:
+        return None
+
+    flags = _key_spec_flags(raw_spec)
+    # An incomplete spec does not describe all of the command's keys (e.g. MIGRATE,
+    # whose leading key argument is a key only when KEYS is absent); extracting the
+    # keys it does describe would route the command by a partial key list.
+    if "incomplete" in flags:
+        return None
+
+    begin_search = _spec_fields(fields.get("begin_search"))
+    if begin_search is None or len(begin_search) != 1:
+        return None
+    if "index" in begin_search:
+        index = _spec_fields(begin_search["index"])
+        if index is None or not isinstance(index.get("index"), int):
+            return None
+        begin: Tuple[str, Any] = ("index", index["index"])
+    elif "keyword" in begin_search:
+        keyword = _spec_fields(begin_search["keyword"])
+        if keyword is None:
+            return None
+        word = keyword.get("keyword")
+        startfrom = keyword.get("startfrom")
+        if not isinstance(word, (str, bytes)) or not isinstance(startfrom, int):
+            return None
+        begin = ("keyword", (str_if_bytes(word), startfrom))
+    else:
+        return None
+
+    find_keys = _spec_fields(fields.get("find_keys"))
+    if find_keys is None or len(find_keys) != 1:
+        return None
+    if "range" in find_keys:
+        range_fields = _spec_fields(find_keys["range"])
+        if range_fields is None:
+            return None
+        lastkey = range_fields.get("lastkey")
+        keystep = range_fields.get("keystep")
+        limit = range_fields.get("limit")
+        if not all(isinstance(value, int) for value in (lastkey, keystep, limit)):
+            return None
+        if keystep <= 0 or limit < 0:
+            return None
+        find: Tuple[str, Any] = ("range", (lastkey, keystep, limit))
+    elif "keynum" in find_keys:
+        keynum = _spec_fields(find_keys["keynum"])
+        if keynum is None:
+            return None
+        keynum_offset = keynum.get("keynum")
+        firstkey = keynum.get("firstkey")
+        keystep = keynum.get("keystep")
+        if not all(
+            isinstance(value, int) for value in (keynum_offset, firstkey, keystep)
+        ):
+            return None
+        if keynum_offset < 0 or firstkey < 0 or keystep <= 0:
+            return None
+        find = ("keynum", (keynum_offset, firstkey, keystep))
+    else:
+        return None
+
+    return frozenset(flags), begin, find
+
+
+def _find_keyword(args: Sequence[Any], word: str, startfrom: int) -> Optional[int]:
+    """
+    Find the position of a key-spec keyword among the command arguments.
+
+    A non-negative ``startfrom`` scans forward from that position; a negative one
+    scans backward from that many arguments before the end, so the last occurrence
+    wins - both exactly as the server searches. Returns None when the keyword is
+    absent.
+    """
+    word = word.translate(_ASCII_LOWER_TABLE)
+    word_bytes = word.encode()
+    if startfrom >= 0:
+        positions = range(startfrom, len(args))
+    else:
+        positions = range(len(args) + startfrom, -1, -1)
+    for position in positions:
+        arg = args[position]
+        if isinstance(arg, bytes):
+            # bytes.lower is ASCII-only, matching the server's strcasecmp.
+            if arg.lower() == word_bytes:
+                return position
+        elif isinstance(arg, str):
+            if arg.translate(_ASCII_LOWER_TABLE) == word:
+                return position
+    return None
+
+
+def _parse_numkeys(value: Any) -> Optional[int]:
+    """
+    Parse a ``keynum`` counter argument with the strictness of the server's
+    ``string2ll``: an optional leading minus followed by ASCII digits, nothing else.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(value, str):
+        digits = value[1:] if value.startswith("-") else value
+        if digits and digits.isascii() and digits.isdigit():
+            return int(value)
+    return None
+
+
+def _extract_keys_from_specs(
+    details: Dict[str, Any], args: Sequence[Any]
+) -> Optional[List[Tuple[Any, FrozenSet[str]]]]:
+    """
+    Extract the key name arguments of a command invocation from its key
+    specifications, without asking the server.
+
+    Args:
+        details: The parsed ``COMMAND`` entry of the command or container
+            subcommand, carrying its ``key_specifications``.
+        args: The full command invocation, with ``args[0]`` the command name, in
+            the shape the server would receive it.
+
+    Returns:
+        A list of ``(key, flags)`` pairs - one per key name argument, in argument
+        order, each carrying the access flags of the key spec that produced it -
+        or None when the specs do not describe the command's keys completely and
+        the keys must be resolved on the server instead. Arguments flagged
+        ``not_key`` are included with their flag; the caller decides whether they
+        participate in slot determination.
+
+    Raises:
+        ResponseError: When the invocation is malformed for a known spec - a
+            ``keynum`` counter that is missing, not a non-negative integer, or
+            counts more keys than the argument list holds, or a fixed key position
+            beyond the argument list. Reported locally with the ``Invalid
+            arguments`` error ``COMMAND GETKEYS`` would produce, so the failure
+            surfaces before the command is routed and sent.
+    """
+    key_specs = details.get("key_specifications")
+    if not key_specs:
+        return None
+
+    keys: List[Tuple[Any, FrozenSet[str]]] = []
+    for raw_spec in key_specs:
+        spec = _normalize_key_spec(raw_spec)
+        if spec is None:
+            return None
+        flags, (begin_type, begin), (find_type, find) = spec
+
+        if begin_type == "index":
+            start = begin
+            if start < 0:
+                start += len(args)
+            if start < 0 or start >= len(args):
+                raise ResponseError("Invalid arguments")
+        else:
+            word, startfrom = begin
+            position = _find_keyword(args, word, startfrom)
+            if position is None:
+                # The keyword is absent: the optional argument group it opens was
+                # not given, so this spec contributes no keys.
+                continue
+            start = position + 1
+
+        if find_type == "range":
+            lastkey, keystep, limit = find
+            if lastkey >= 0:
+                last = start + lastkey
+                if last >= len(args):
+                    raise ResponseError("Invalid arguments")
+            else:
+                last = len(args) + lastkey
+                if limit:
+                    # The trailing arguments come in groups of ``limit`` and only
+                    # the first of each group is a key (e.g. XREAD, where stream
+                    # names and ids alternate).
+                    last = start + (last - start + 1) // limit - 1
+            step = keystep
+        else:
+            keynum_offset, firstkey, keystep = find
+            numkeys_position = start + keynum_offset
+            if numkeys_position >= len(args):
+                raise ResponseError("Invalid arguments")
+            numkeys = _parse_numkeys(args[numkeys_position])
+            if numkeys is None or numkeys < 0:
+                raise ResponseError("Invalid arguments")
+            start += firstkey
+            last = start + (numkeys - 1) * keystep
+            if numkeys and last >= len(args):
+                raise ResponseError("Invalid arguments")
+            step = keystep
+
+        for position in range(start, last + 1, step):
+            keys.append((args[position], flags))
+
+    return keys
