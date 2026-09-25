@@ -1,5 +1,6 @@
 from redis import asyncio  # noqa
 from redis.backoff import default_backoff
+from redis.bitfield_layout import BitFieldLayout, CompiledBitFieldLayout
 from redis.client import Redis, StrictRedis
 from redis.driver_info import DriverInfo
 from redis.cluster import RedisCluster
@@ -72,11 +73,13 @@ VERSION = tuple(map(int_or_str, __version__.split(".")))
 __all__ = [
     "AuthenticationError",
     "AuthenticationWrongNumberOfArgsError",
+    "BitFieldLayout",
     "BlockingConnectionPool",
     "BusyLoadingError",
     "ChannelType",
     "ChildDeadlockedError",
     "ClusterKeyspaceNotifications",
+    "CompiledBitFieldLayout",
     "Connection",
     "ConnectionError",
     "ConnectionPool",

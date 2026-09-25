@@ -16,6 +16,7 @@ import pytest_asyncio
 from redis import DataError, RedisClusterException, ResponseError
 
 from redis import exceptions
+from redis.bitfield_layout import BitFieldLayout
 from redis._parsers.helpers import (
     _RedisCallbacks,
     get_response_callbacks,
@@ -6443,6 +6444,84 @@ class TestRedisCommands:
         items = [("u4", 8), ("u4", 12), ("u4", 13)]
         resp = await r.bitfield_ro("a", "u8", 0, items)
         assert resp == [0, 15, 15, 14]
+
+    @skip_if_server_version_lt("6.0.0")
+    async def test_bitfield_layout(self, r: redis.Redis):
+        layout = (
+            BitFieldLayout(stride=24)
+            .field("score", "i5")
+            .gap(3)
+            .field("level", "u11")
+            .compile()
+        )
+
+        # exact bytes: i5(-1)=11111, 3 gap bits, u11(2047)=11111111111
+        plan = layout.write("bits", record=0, values={"score": -1, "level": 2047})
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": 0,
+            "level": 0,
+        }
+        assert await r.get("bits") == b"\xf8\xff\xe0"
+
+        # an adjacent record must not clobber its neighbour
+        plan = layout.write("bits", record=1, values={"score": -16, "level": 0})
+        await r.execute_command(*plan.command)
+        assert await r.get("bits") == b"\xf8\xff\xe0\x80\x00\x00"
+
+        # reads go through BITFIELD_RO and map values back to field names
+        plan = layout.read("bits", record=0)
+        assert plan.command[0] == "BITFIELD_RO"
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": -1,
+            "level": 2047,
+        }
+        plan = layout.read("bits", record=1)
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": -16,
+            "level": 0,
+        }
+
+        # negative and maximum values
+        plan = layout.write("bits", record=2, values={"score": 15, "level": 2047})
+        await r.execute_command(*plan.command)
+        plan = layout.read("bits", record=2)
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": 15,
+            "level": 2047,
+        }
+
+        # WRAP truncates to the field width
+        plan = layout.write("bits", record=2, values={"score": 16, "level": 2048})
+        await r.execute_command(*plan.command)
+        plan = layout.read("bits", record=2)
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": -16,
+            "level": 0,
+        }
+
+        # SAT clamps to the field range
+        plan = layout.write(
+            "bits", record=2, values={"score": -17, "level": 5000}, overflow="SAT"
+        )
+        await r.execute_command(*plan.command)
+        plan = layout.read("bits", record=2)
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": -16,
+            "level": 2047,
+        }
+
+        # FAIL skips only the overflowing field; the rest is still written
+        plan = layout.write(
+            "bits", record=2, values={"score": 7, "level": 5000}, overflow="FAIL"
+        )
+        assert plan.skipped == ("level",)
+        result = plan.parse(await r.execute_command(*plan.command))
+        assert result == {"score": -16, "level": None}
+        plan = layout.read("bits", record=2)
+        assert plan.parse(await r.execute_command(*plan.command)) == {
+            "score": 7,
+            "level": 2047,
+        }
 
     @skip_if_server_version_lt("4.0.0")
     async def test_memory_stats(self, r: redis.Redis):
