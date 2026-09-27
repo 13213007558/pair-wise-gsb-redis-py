@@ -2362,13 +2362,22 @@ class RedisCluster(
 
 
 class ClusterNode:
-    def __init__(self, host, port, server_type=None, redis_connection=None):
+    def __init__(
+        self,
+        host,
+        port,
+        server_type=None,
+        redis_connection=None,
+        *,
+        node_id: Optional[str] = None,
+    ):
         if host == "localhost":
             host = socket.gethostbyname(host)
 
         self.host = host
         self.port = port
         self.name = get_node_name(host, port)
+        self.node_id = node_id
         self.server_type = server_type
         self.redis_connection = redis_connection
 
@@ -2376,7 +2385,7 @@ class ClusterNode:
         return (
             f"[host={self.host},"
             f"port={self.port},"
-            f"name={self.name},"
+            f"name={self.name},node_id={self.node_id},"
             f"server_type={self.server_type},"
             f"redis_connection={self.redis_connection}]"
         )
@@ -2809,7 +2818,9 @@ class NodesManager:
             )
         return r
 
-    def _get_or_create_cluster_node(self, host, port, role, tmp_nodes_cache):
+    def _get_or_create_cluster_node(
+        self, host, port, role, tmp_nodes_cache, node_id=None
+    ):
         node_name = get_node_name(host, port)
         # check if we already have this node in the tmp_nodes_cache
         target_node = tmp_nodes_cache.get(node_name)
@@ -2824,7 +2835,9 @@ class NodesManager:
                     redis_connection = previous_node.redis_connection
             # don't update the old ClusterNode, so we don't update its role
             # outside of the lock
-            target_node = ClusterNode(host, port, role, redis_connection)
+            target_node = ClusterNode(
+                host, port, role, redis_connection, node_id=node_id
+            )
             # add this node to the nodes cache
             tmp_nodes_cache[target_node.name] = target_node
 
@@ -3045,8 +3058,11 @@ class NodesManager:
 
                     nodes_for_slot = []
 
+                    node_id = (
+                        str_if_bytes(primary_node[2]) if len(primary_node) > 2 else None
+                    )
                     target_node = self._get_or_create_cluster_node(
-                        host, port, PRIMARY, tmp_nodes_cache
+                        host, port, PRIMARY, tmp_nodes_cache, node_id
                     )
                     nodes_for_slot.append(target_node)
 
@@ -3055,8 +3071,13 @@ class NodesManager:
                         host = str_if_bytes(replica_node[0])
                         port = int(replica_node[1])
                         host, port = self.remap_host_port(host, port)
+                        replica_id = (
+                            str_if_bytes(replica_node[2])
+                            if len(replica_node) > 2
+                            else None
+                        )
                         target_replica_node = self._get_or_create_cluster_node(
-                            host, port, REPLICA, tmp_nodes_cache
+                            host, port, REPLICA, tmp_nodes_cache, replica_id
                         )
                         nodes_for_slot.append(target_replica_node)
 

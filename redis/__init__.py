@@ -3,6 +3,8 @@ from redis.backoff import default_backoff
 from redis.client import Redis, StrictRedis
 from redis.driver_info import DriverInfo
 from redis.cluster import RedisCluster
+from redis.cluster_scan import ClusterScanNode, ClusterScanSession
+from redis.cluster_scan import ClusterScanTopologyChanges, ClusterScanTopologyError
 from redis.connection import (
     BlockingConnectionPool,
     Connection,
@@ -77,6 +79,10 @@ __all__ = [
     "ChannelType",
     "ChildDeadlockedError",
     "ClusterKeyspaceNotifications",
+    "ClusterScanNode",
+    "ClusterScanSession",
+    "ClusterScanTopologyChanges",
+    "ClusterScanTopologyError",
     "Connection",
     "ConnectionError",
     "ConnectionPool",

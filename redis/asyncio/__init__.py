@@ -20,6 +20,12 @@ from redis.asyncio.sentinel import (
 )
 from redis.asyncio.utils import from_url
 from redis.backoff import default_backoff
+from redis.cluster_scan import (
+    ClusterScanNode,
+    ClusterScanSession,
+    ClusterScanTopologyChanges,
+    ClusterScanTopologyError,
+)
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
@@ -47,6 +53,10 @@ __all__ = [
     "BlockingConnectionPool",
     "BusyLoadingError",
     "ChildDeadlockedError",
+    "ClusterScanNode",
+    "ClusterScanSession",
+    "ClusterScanTopologyChanges",
+    "ClusterScanTopologyError",
     "Connection",
     "ConnectionError",
     "ConnectionPool",

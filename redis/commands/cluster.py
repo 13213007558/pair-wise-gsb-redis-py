@@ -18,6 +18,14 @@ from typing import (
     overload,
 )
 
+from redis.cluster_scan import (
+    ClusterScanSession,
+    ClusterScanTopologyChanges,
+    cluster_node_id,
+    create_cluster_scan_session,
+    refresh_cluster_scan_session,
+    update_cluster_scan_node,
+)
 from redis.crc import key_slot
 from redis.exceptions import RedisClusterException, RedisError
 from redis.typing import (
@@ -1483,6 +1491,100 @@ class ClusterDataAccessCommands(DataAccessCommands):
                     name: cursor for name, cursor in cursors.items() if cursor != 0
                 }
 
+    def create_scan_session(
+        self,
+        match: PatternT | None = None,
+        count: int | None = None,
+        _type: str | None = None,
+        target_nodes: TargetNodesT | None = None,
+    ) -> ClusterScanSession:
+        """
+        Create a serializable SCAN session for the selected cluster nodes.
+
+        The session stores each node's stable ID, address, cursor, completion
+        state and slot ranges. Its MATCH, COUNT and TYPE options cannot be
+        changed on resume.
+        """
+        return create_cluster_scan_session(
+            self,
+            match=match,
+            count=count,
+            _type=_type,
+            target_nodes=target_nodes,
+        )
+
+    def scan_session(
+        self,
+        session: ClusterScanSession,
+        *,
+        strict: bool = True,
+        include_new_nodes: bool = False,
+    ) -> tuple[ClusterScanSession, list[Any], ClusterScanTopologyChanges]:
+        """
+        Execute one cluster SCAN batch and update the serializable session.
+
+        Address changes are followed through the node's stable ID. In strict
+        mode, a missing original node or a new node raises a topology error
+        with the unfinished slot ranges. Pass ``include_new_nodes=True`` to
+        explicitly add new nodes; their scans start from cursor zero. This is
+        not a snapshot under concurrent slot migration and does not deduplicate
+        keys Redis SCAN may revisit as key ownership changes; resumption itself
+        does not restart a reachable node's saved cursor.
+        """
+        changes = refresh_cluster_scan_session(
+            self,
+            session,
+            strict=strict,
+            include_new_nodes=include_new_nodes,
+        )
+        data: list[Any] = []
+        for node_state in session.nodes.values():
+            if node_state.completed or node_state.state != "active":
+                continue
+            node = self.get_node(node_name=node_state.address)
+            if node is None or cluster_node_id(node) != node_state.node_id:
+                refresh_cluster_scan_session(
+                    self,
+                    session,
+                    strict=strict,
+                    include_new_nodes=include_new_nodes,
+                )
+                continue
+            cursors, batch = self.scan(
+                cursor=node_state.cursor,
+                match=session.match,
+                count=session.count,
+                _type=session.type,
+                target_nodes=node,
+            )
+            update_cluster_scan_node(
+                session,
+                node_state.node_id,
+                node_state.address,
+                cursors[node_state.address],
+            )
+            data.extend(batch)
+        return session, data, changes
+
+    def scan_session_iter(
+        self,
+        session: ClusterScanSession,
+        *,
+        strict: bool = True,
+        include_new_nodes: bool = False,
+    ) -> Iterator:
+        """Yield keys until the caller stops or the bound session completes."""
+        while any(
+            not node.completed and node.state == "active"
+            for node in session.nodes.values()
+        ):
+            _, batch, _ = self.scan_session(
+                session,
+                strict=strict,
+                include_new_nodes=include_new_nodes,
+            )
+            yield from batch
+
 
 class AsyncClusterDataAccessCommands(
     ClusterDataAccessCommands, AsyncDataAccessCommands
@@ -1530,6 +1632,88 @@ class AsyncClusterDataAccessCommands(
                 cursors = {
                     name: cursor for name, cursor in cursors.items() if cursor != 0
                 }
+
+    async def create_scan_session(
+        self,
+        match: PatternT | None = None,
+        count: int | None = None,
+        _type: str | None = None,
+        target_nodes: TargetNodesT | None = None,
+    ) -> ClusterScanSession:
+        """Create a serializable session with bound MATCH, COUNT and TYPE."""
+        return create_cluster_scan_session(
+            self,
+            match=match,
+            count=count,
+            _type=_type,
+            target_nodes=target_nodes,
+        )
+
+    async def scan_session(
+        self,
+        session: ClusterScanSession,
+        *,
+        strict: bool = True,
+        include_new_nodes: bool = False,
+    ) -> tuple[ClusterScanSession, list[Any], ClusterScanTopologyChanges]:
+        """Execute one async cluster SCAN batch and update the session.
+
+        See the synchronous method for topology, snapshot and duplicate limits.
+        """
+        changes = refresh_cluster_scan_session(
+            self,
+            session,
+            strict=strict,
+            include_new_nodes=include_new_nodes,
+        )
+        data: list[Any] = []
+        for node_state in session.nodes.values():
+            if node_state.completed or node_state.state != "active":
+                continue
+            node = self.get_node(node_name=node_state.address)
+            if node is None or cluster_node_id(node) != node_state.node_id:
+                refresh_cluster_scan_session(
+                    self,
+                    session,
+                    strict=strict,
+                    include_new_nodes=include_new_nodes,
+                )
+                continue
+            cursors, batch = await self.scan(
+                cursor=node_state.cursor,
+                match=session.match,
+                count=session.count,
+                _type=session.type,
+                target_nodes=node,
+            )
+            update_cluster_scan_node(
+                session,
+                node_state.node_id,
+                node_state.address,
+                cursors[node_state.address],
+            )
+            data.extend(batch)
+        return session, data, changes
+
+    async def scan_session_iter(
+        self,
+        session: ClusterScanSession,
+        *,
+        strict: bool = True,
+        include_new_nodes: bool = False,
+    ) -> AsyncIterator:
+        """Yield keys until the caller stops or the bound session completes."""
+        while any(
+            not node.completed and node.state == "active"
+            for node in session.nodes.values()
+        ):
+            _, batch, _ = await self.scan_session(
+                session,
+                strict=strict,
+                include_new_nodes=include_new_nodes,
+            )
+            for value in batch:
+                yield value
 
 
 class RedisClusterCommands(

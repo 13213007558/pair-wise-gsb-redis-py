@@ -1,5 +1,7 @@
 import binascii
+import copy
 import datetime
+import json
 import select
 import socket
 import socketserver
@@ -33,7 +35,8 @@ from redis.cluster import (
     get_node_name,
 )
 from redis.cache import CacheConfig
-from redis.commands.cluster import ClusterMultiKeyCommands
+from redis.commands.cluster import ClusterDataAccessCommands, ClusterMultiKeyCommands
+from redis.cluster_scan import ClusterScanSession, ClusterScanTopologyError
 from redis.commands.core import HotkeysMetricsTypes
 from redis.commands.metadata import (
     CommandMetadata,
@@ -3707,9 +3710,24 @@ class TestNodesManager:
         Test that slots cache can in initialized and all slots are covered
         """
         good_slots_resp = [
-            [0, 5460, ["127.0.0.1", 7000], ["127.0.0.2", 7003]],
-            [5461, 10922, ["127.0.0.1", 7001], ["127.0.0.2", 7004]],
-            [10923, 16383, ["127.0.0.1", 7002], ["127.0.0.2", 7005]],
+            [
+                0,
+                5460,
+                ["127.0.0.1", 7000, "primary-0"],
+                ["127.0.0.2", 7003, "replica-0"],
+            ],
+            [
+                5461,
+                10922,
+                ["127.0.0.1", 7001, "primary-1"],
+                ["127.0.0.2", 7004, "replica-1"],
+            ],
+            [
+                10923,
+                16383,
+                ["127.0.0.1", 7002, "primary-2"],
+                ["127.0.0.2", 7005, "replica-2"],
+            ],
         ]
 
         rc = get_mocked_redis_client(
@@ -3717,7 +3735,7 @@ class TestNodesManager:
         )
         n_manager = rc.nodes_manager
         assert len(n_manager.slots_cache) == REDIS_CLUSTER_HASH_SLOTS
-        for slot_info in good_slots_resp:
+        for shard_index, slot_info in enumerate(good_slots_resp):
             all_hosts = ["127.0.0.1", "127.0.0.2"]
             all_ports = [7000, 7001, 7002, 7003, 7004, 7005]
             slot_start = slot_info[0]
@@ -3728,6 +3746,9 @@ class TestNodesManager:
                 assert n_manager.slots_cache[i][1].host in all_hosts
                 assert n_manager.slots_cache[i][0].port in all_ports
                 assert n_manager.slots_cache[i][1].port in all_ports
+                expected_id = str(shard_index)
+                assert n_manager.slots_cache[i][0].node_id == f"primary-{expected_id}"
+                assert n_manager.slots_cache[i][1].node_id == f"replica-{expected_id}"
 
         assert len(n_manager.nodes_cache) == 6
 
@@ -6180,3 +6201,215 @@ class TestClusterPipelineMetricsRecording:
             duration = call_obj[0][0]
             assert isinstance(duration, float)
             assert duration >= 0
+
+
+class FakeScanNode:
+    def __init__(self, node_id, host, port):
+        self.node_id = node_id
+        self.host = host
+        self.port = port
+        self.name = get_node_name(host, port)
+
+
+class FakeScanTopology:
+    def __init__(self, slots_cache):
+        self.slots_cache = slots_cache
+
+
+class FakeClusterScanClient(ClusterDataAccessCommands):
+    def __init__(self):
+        self.nodes = [
+            FakeScanNode("node-a", "10.0.0.1", 7000),
+            FakeScanNode("node-b", "10.0.0.2", 7000),
+        ]
+        self.nodes_manager = FakeScanTopology(self._build_slots(self.nodes))
+        self.calls = []
+        self.moved_slots = False
+
+    def _build_slots(self, nodes):
+        return {slot: [nodes[0]] for slot in range(8192)} | {
+            slot: [nodes[1]] for slot in range(8192, 16384)
+        }
+
+    def get_primaries(self):
+        return list(self.nodes)
+
+    def get_replicas(self):
+        return []
+
+    def get_nodes(self):
+        return list(self.nodes)
+
+    def get_node(self, host=None, port=None, node_name=None):
+        return next((node for node in self.nodes if node.name == node_name), None)
+
+    def move_node_a_address(self):
+        self.nodes[0] = FakeScanNode("node-a", "10.0.0.3", 7000)
+        self.nodes_manager.slots_cache = self._build_slots(self.nodes)
+
+    def move_slots_to_b(self):
+        self.moved_slots = True
+        self.nodes_manager.slots_cache = {
+            slot: [self.nodes[1]] for slot in range(16384)
+        }
+
+    def add_node_and_move_slots(self):
+        self.nodes.append(FakeScanNode("node-c", "10.0.0.4", 7000))
+        self.nodes_manager.slots_cache = (
+            {slot: [self.nodes[0]] for slot in range(5461)}
+            | {slot: [self.nodes[1]] for slot in range(5461, 10923)}
+            | {slot: [self.nodes[2]] for slot in range(10923, 16384)}
+        )
+
+    def remove_node_a(self):
+        self.nodes = [self.nodes[1]]
+        self.nodes_manager.slots_cache = {
+            slot: [self.nodes[0]] for slot in range(16384)
+        }
+
+    def scan(self, cursor=0, match=None, count=None, _type=None, target_nodes=None):
+        self.calls.append((target_nodes.name, cursor, match, count, _type))
+        if target_nodes.node_id == "node-a":
+            if cursor == 0:
+                return {target_nodes.name: 11}, []
+            if cursor == 11:
+                data = [b"a:seen"]
+                if self.moved_slots:
+                    data.append(b"moved-key")
+                return {target_nodes.name: 0}, data
+        if target_nodes.node_id == "node-b":
+            if cursor == 0:
+                return {target_nodes.name: 22}, []
+            if cursor == 22:
+                return {target_nodes.name: 33}, []
+            if cursor == 33:
+                data = [b"b:seen"]
+                if self.moved_slots:
+                    data.append(b"moved-key")
+                return {target_nodes.name: 0}, data
+        if target_nodes.node_id == "node-c":
+            return {target_nodes.name: 0}, [b"c:seen"]
+        raise AssertionError(f"unexpected scan on {target_nodes.name}:{cursor}")
+
+
+class TestClusterScanSession:
+    def test_serialization_binds_options_and_empty_batch_does_not_complete(self):
+        client = FakeClusterScanClient()
+        session = client.create_scan_session(match=b"*", count=100, _type="STRING")
+
+        session, keys, _ = client.scan_session(session)
+
+        assert keys == []
+        assert not session.complete
+        assert session.nodes["node-a"].cursor == 11
+        assert not session.nodes["node-a"].completed
+        assert session.nodes["node-b"].cursor == 22
+        assert not session.nodes["node-b"].completed
+
+        restored = ClusterScanSession.from_dict(session.to_dict())
+        assert restored.match == b"*"
+        assert restored.count == 100
+        assert restored.type == "STRING"
+        assert (
+            ClusterScanSession.from_dict(
+                json.loads(json.dumps(session.to_dict()))
+            ).match
+            == b"*"
+        )
+        assert restored.nodes["node-a"].address == "10.0.0.1:7000"
+        assert restored.nodes["node-a"].slots == [(0, 8191)]
+        assert restored.nodes["node-b"].slots == [(8192, 16383)]
+
+    def test_resume_follows_address_change_without_rescanning_node(self):
+        client = FakeClusterScanClient()
+        session = client.create_scan_session(count=100)
+        client.scan_session(session)
+        serialized = session.to_dict()
+
+        client.move_node_a_address()
+        session = ClusterScanSession.from_dict(serialized)
+        session, keys, changes = client.scan_session(session)
+        assert keys == [b"a:seen"]
+        session, keys, _ = client.scan_session(session)
+        assert keys == [b"b:seen"]
+
+        assert changes.address_changes == {"node-a": ("10.0.0.1:7000", "10.0.0.3:7000")}
+        assert session.complete
+        assert (
+            "10.0.0.3:7000",
+            11,
+            None,
+            100,
+            None,
+        ) in client.calls
+        assert (
+            "10.0.0.3:7000",
+            0,
+            None,
+            100,
+            None,
+        ) not in client.calls
+
+    def test_iterator_pauses_after_empty_batch_and_resumes_cursor(self):
+        client = FakeClusterScanClient()
+        session = client.create_scan_session(count=100)
+        iterator = client.scan_session_iter(session)
+
+        assert next(iterator) == b"a:seen"
+        serialized = session.to_dict()
+        client.move_node_a_address()
+        session = ClusterScanSession.from_dict(serialized)
+
+        assert list(client.scan_session_iter(session)) == [b"b:seen"]
+        assert session.complete
+
+    def test_slot_change_is_reported_without_snapshot_or_deduplication_claim(self):
+        client = FakeClusterScanClient()
+        session = client.create_scan_session(count=100)
+        client.scan_session(session)
+        client.move_slots_to_b()
+
+        session, keys, changes = client.scan_session(session, strict=False)
+        assert keys == [b"a:seen", b"moved-key"]
+        session, keys, _ = client.scan_session(session, strict=False)
+        assert keys == [b"b:seen", b"moved-key"]
+
+        assert (0, 8191, "node-a", "node-b") in changes.slot_owner_changes
+        assert session.complete
+        assert [call[1] for call in client.calls] == [0, 0, 11, 22, 33]
+
+    def test_strict_mode_reports_missing_unfinished_ranges(self):
+        client = FakeClusterScanClient()
+        session = client.create_scan_session(count=100)
+        client.scan_session(session)
+        client.remove_node_a()
+
+        with pytest.raises(ClusterScanTopologyError) as exc_info:
+            client.scan_session(session)
+
+        assert exc_info.value.changes.missing_node_ids == ["node-a"]
+        assert exc_info.value.unfinished_ranges == [("node-a", [(0, 8191)])]
+
+    def test_new_node_requires_explicit_inclusion_and_starts_from_zero(self):
+        client = FakeClusterScanClient()
+        session = client.create_scan_session(count=100)
+        client.scan_session(session)
+        client.add_node_and_move_slots()
+
+        with pytest.raises(ClusterScanTopologyError) as exc_info:
+            client.scan_session(session, strict=False)
+        assert exc_info.value.changes.new_node_ids == ["node-c"]
+
+        session = ClusterScanSession.from_dict(copy.deepcopy(session.to_dict()))
+        session, keys, changes = client.scan_session(
+            session, strict=False, include_new_nodes=True
+        )
+        assert changes.new_node_ids == ["node-c"]
+        assert keys == [b"a:seen", b"c:seen"]
+        session, keys, _ = client.scan_session(
+            session, strict=False, include_new_nodes=True
+        )
+        assert keys == [b"b:seen"]
+        assert session.nodes["node-c"].cursor == 0
+        assert session.nodes["node-c"].completed
+        assert session.complete

@@ -1862,6 +1862,7 @@ class ClusterNode:
         "host",
         "max_connections",
         "name",
+        "node_id",
         "port",
         "response_callbacks",
         "server_type",
@@ -1873,6 +1874,7 @@ class ClusterNode:
         port: Union[str, int],
         server_type: Optional[str] = None,
         *,
+        node_id: Optional[str] = None,
         max_connections: int = 100,
         connection_class: Type[Connection] = Connection,
         **connection_kwargs: Any,
@@ -1885,6 +1887,7 @@ class ClusterNode:
         self.host = host
         self.port = port
         self.name = get_node_name(host, port)
+        self.node_id = node_id
         self.server_type = server_type
 
         self.max_connections = max_connections
@@ -1901,8 +1904,8 @@ class ClusterNode:
 
     def __repr__(self) -> str:
         return (
-            f"[host={self.host}, port={self.port}, "
-            f"name={self.name}, server_type={self.server_type}]"
+            f"[host={self.host}, port={self.port}, name={self.name}, "
+            f"node_id={self.node_id}, server_type={self.server_type}]"
         )
 
     def __eq__(self, obj: Any) -> bool:
@@ -2576,8 +2579,17 @@ class NodesManager:
 
                     target_node = tmp_nodes_cache.get(get_node_name(host, port))
                     if not target_node:
+                        node_id = (
+                            str_if_bytes(primary_node[2])
+                            if len(primary_node) > 2
+                            else None
+                        )
                         target_node = ClusterNode(
-                            host, port, PRIMARY, **self.connection_kwargs
+                            host,
+                            port,
+                            PRIMARY,
+                            node_id=node_id,
+                            **self.connection_kwargs,
                         )
                     # add this node to the nodes cache
                     tmp_nodes_cache[target_node.name] = target_node
@@ -2593,8 +2605,17 @@ class NodesManager:
                             get_node_name(host, port)
                         )
                         if not target_replica_node:
+                            replica_id = (
+                                str_if_bytes(replica_node[2])
+                                if len(replica_node) > 2
+                                else None
+                            )
                             target_replica_node = ClusterNode(
-                                host, port, REPLICA, **self.connection_kwargs
+                                host,
+                                port,
+                                REPLICA,
+                                node_id=replica_id,
+                                **self.connection_kwargs,
                             )
                         # add this node to the nodes cache
                         tmp_nodes_cache[target_replica_node.name] = target_replica_node
