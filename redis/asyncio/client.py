@@ -82,6 +82,7 @@ from redis.event import (
 from redis.exceptions import (
     ConnectionError,
     ExecAbortError,
+    ExecUnknownError,
     PubSubError,
     RedisError,
     ResponseError,
@@ -1991,6 +1992,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         self.command_stack: CommandStackT = []
         self.scripts: Set[Script] = set()
         self.explicit_transaction = False
+        # True once the MULTI..EXEC batch of a WATCHed transaction has been
+        # written to the socket. Until the EXEC reply is parsed, a connection
+        # failure at that point leaves the transaction outcome unknown.
+        self.exec_sent: bool = False
 
     async def __aenter__(self: _RedisT) -> _RedisT:
         return self
@@ -2038,6 +2043,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         finally:
             self.watching = False
             self.explicit_transaction = False
+            self.exec_sent = False
             # We can safely return the connection to the pool here since we're
             # sure we're no longer WATCHing anything. Detach self.connection
             # before awaiting release: if a second cancel aborts the await,
@@ -2205,6 +2211,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             [args for args, options in cmds if EMPTY_RESPONSE not in options],
         )
         await connection.send_packed_command(all_cmds)
+        # The whole MULTI..EXEC batch is one write. Once it has been accepted
+        # by the socket, a later failure means EXEC may already have run, so
+        # the failure hook must not disguise it as a re-runnable WatchError.
+        self.exec_sent = self.watching
         errors = []
 
         # parse off the response for MULTI
@@ -2237,6 +2247,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         # EXEC clears any watched keys
         self.watching = False
+        self.exec_sent = False
 
         if response is None:
             raise WatchError("Watched variable changed.") from None
@@ -2405,6 +2416,16 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         # since this connection has died. raise a WatchError, which
         # indicates the user should retry this transaction.
         if self.watching:
+            # EXEC was already on the wire when the connection died, so the
+            # server may have executed the transaction. This must not be
+            # reported as a plain WatchError: re-running the cycle blindly
+            # could apply the same writes a second time.
+            if self.exec_sent:
+                await self.reset()
+                raise ExecUnknownError(
+                    f"Connection lost after EXEC was sent ({type(error).__name__}); "
+                    "the transaction outcome is unknown"
+                )
             raise WatchError(
                 f"A {type(error).__name__} occurred while watching one or more keys"
             )

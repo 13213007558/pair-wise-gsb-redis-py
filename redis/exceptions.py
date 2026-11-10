@@ -70,6 +70,21 @@ class WatchError(RedisError):
     pass
 
 
+class ExecUnknownError(RedisError):
+    """Raised when a connection fails after ``EXEC`` was sent but before its
+    reply was read inside a WATCHed transaction.
+
+    The server may or may not have executed the transaction. Unlike a
+    :class:`WatchError`, this is not a signal that the whole WATCH/read/MULTI
+    cycle can simply be repeated: re-running the transaction blindly can apply
+    the same writes twice. Callers must determine the outcome (for example by
+    reading the affected keys or using an idempotency marker) before deciding
+    whether another attempt is safe.
+    """
+
+    pass
+
+
 class NoScriptError(ResponseError):
     pass
 

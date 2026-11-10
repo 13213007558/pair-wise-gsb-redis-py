@@ -79,6 +79,7 @@ from redis.exceptions import (
     CrossSlotTransactionError,
     DataError,
     ExecAbortError,
+    ExecUnknownError,
     InvalidPipelineStack,
     MaxClientsReachedError,
     MaxConnectionsError,
@@ -6934,6 +6935,9 @@ class TransactionStrategy(AbstractStrategy):
         self._transaction_connection: Optional[Connection] = None
         self._transaction_node: Optional[ClusterNode] = None
         self._executing = False
+        # True once the MULTI..EXEC batch has been written to the socket.
+        # A later connection failure leaves the EXEC outcome unknown.
+        self._exec_sent: bool = False
         # The error the running retry is retrying, and when the last refresh
         # had ended by then: a refresh since that reached no node ends the
         # retries (see NodesManager._error_instead_of_retry)
@@ -7212,6 +7216,14 @@ class TransactionStrategy(AbstractStrategy):
                 raise WatchError(
                     "Slot rebalancing occurred while watching keys"
                 ) from error
+            if self._exec_sent:
+                # EXEC was already on the wire when the connection failed;
+                # the transaction may have committed. Do not disguise this as
+                # a re-runnable WatchError.
+                raise ExecUnknownError(
+                    f"Connection lost after EXEC was sent ({type(error).__name__}); "
+                    "the transaction outcome is unknown"
+                ) from error
             raise WatchError("An error occurred while watching keys") from error
 
     def _raise_first_error(self, responses, stack, start_time):
@@ -7294,6 +7306,7 @@ class TransactionStrategy(AbstractStrategy):
         start_time = time.monotonic()
 
         connection.send_packed_command(packed_commands)
+        self._exec_sent = self._watch_acknowledged
         errors = []
 
         # parse off the response for MULTI
@@ -7348,6 +7361,7 @@ class TransactionStrategy(AbstractStrategy):
         # EXEC clears any watched keys
         self._watching = False
         self._watch_acknowledged = False
+        self._exec_sent = False
 
         if response is None:
             raise WatchError("Watched variable changed.")
@@ -7426,6 +7440,7 @@ class TransactionStrategy(AbstractStrategy):
         self._pipeline_slots = set()
         self._transaction_has_keyed_slot = False
         self._executing = False
+        self._exec_sent = False
         self._retrying = None
 
     def send_cluster_commands(

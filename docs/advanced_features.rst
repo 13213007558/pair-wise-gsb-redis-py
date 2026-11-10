@@ -151,6 +151,66 @@ like this, which is much easier to read:
 Be sure to call pipe.multi() in the callable passed to Redis.transaction
 prior to any write commands.
 
+Retries and disconnects during a WATCHed transaction
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A generic connection-level ``Retry`` (see :doc:`retry`) only knows how to
+re-issue a command on a fresh socket. It cannot rebuild the WATCH state or the
+read-then-write decision your callback made, because those live in the
+pipeline and in application code. The client therefore splits a disconnect
+during a WATCHed transaction into two cases instead of retrying blindly:
+
+* The failure happens while nothing has been committed yet - the WATCH or one
+  of the pre-MULTI reads fails, or the connection dies before the
+  MULTI/EXEC batch reaches the server. The client disconnects, drops the
+  stale WATCH and raises :class:`~redis.exceptions.WatchError`. Repeating the
+  whole cycle (re-WATCH, re-read, re-decide, new MULTI/EXEC) is safe.
+* The failure happens after EXEC was written to the socket but before its
+  reply was read. The server may already have executed the transaction, so the
+  outcome is unknown. The client raises
+  :class:`~redis.exceptions.ExecUnknownError`, which is deliberately **not** a
+  ``WatchError``: swallowing it and re-running the transaction could apply the
+  same writes twice. Resolve it by checking the affected keys (or an
+  idempotency marker) before attempting anything else.
+
+Only the first case belongs in an automatic retry loop. A safe caller retries
+the complete WATCH/read/MULTI/EXEC cycle on ``WatchError`` and lets
+``ExecUnknownError`` escape for explicit handling:
+
+.. code:: python
+
+   from redis.exceptions import ExecUnknownError, WatchError
+
+   def update_owner(r, key, new_owner):
+       while True:
+           with r.pipeline() as pipe:
+               try:
+                   pipe.watch(key)
+                   # re-read the condition on every attempt, never reuse a
+                   # value captured before a reconnect
+                   current_owner = pipe.get(key)
+                   if current_owner != b"alice":
+                       return None
+                   pipe.multi()
+                   pipe.set(key, new_owner)
+                   return pipe.execute()
+               except WatchError:
+                   # nothing committed: re-WATCH and re-read from scratch
+                   continue
+               # ExecUnknownError is intentionally not caught here: EXEC was
+               # already sent and may have committed. Inspect the key before
+               # deciding whether another attempt is safe.
+
+The asyncio client (``redis.asyncio``) raises the same two exception types
+with the same semantics, so the async version differs only in the ``await``
+keywords. The cluster ``ClusterPipeline`` transaction strategy applies the
+same rule: a slot rebalancing (MOVED/ASK) while WATCHing is still a
+``WatchError`` because the moved transaction did not run, but a connection
+failure after EXEC was sent is an ``ExecUnknownError``. Note that the
+convenience ``transaction()`` helper only restarts on ``WatchError``; an
+``ExecUnknownError`` propagates to the caller rather than replaying the
+callback.
+
 Pipelines in clusters
 ~~~~~~~~~~~~~~~~~~~~~
 

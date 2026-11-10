@@ -1043,3 +1043,148 @@ class TestPipelineRetryChecker:
 
         assert not pipeline.watching
         assert connection.disconnected
+
+
+@pytest.mark.fixed_client
+class TestPipelineWatchDisconnect:
+    """Disconnects injected at the four points of a WATCH/MULTI/EXEC cycle.
+
+    The generic connection-level Retry must never re-send queued writes on a
+    fresh connection without re-establishing the WATCH and re-reading the
+    condition. A failure after EXEC left the wire is an unknown outcome, not a
+    re-runnable WatchError.
+    """
+
+    class FakeConnection:
+        host = "localhost"
+        port = 6379
+        db = 0
+        _resp2_fallback = False
+
+        def __init__(self, retry, fail_point, log):
+            self.retry = retry
+            self.fail_point = fail_point
+            self.log = log
+            self.generation = 0
+            self.connected = True
+            self._replies = []
+            self._cursor = 0
+
+        def _fail(self, point):
+            if self.fail_point == point and self.generation == 0:
+                self.log.append(("disconnect", point))
+                self.connected = False
+                raise redis.ConnectionError(f"lost at point {point}")
+
+        def _ensure(self):
+            if not self.connected:
+                self.generation += 1
+                self.connected = True
+                self._replies = []
+                self._cursor = 0
+                self.log.append(("reconnect", self.generation))
+
+        def disconnect(self, *args, **kwargs):
+            self.connected = False
+
+        def send_command(self, *args, **kwargs):
+            self._ensure()
+            name = args[0]
+            self.log.append(("send", self.generation, name))
+            self._fail(1)
+            self._replies.append(True if name in {"WATCH", "UNWATCH"} else b"100")
+
+        def read_response(self, *args, **kwargs):
+            self._ensure()
+            reply = self._replies[self._cursor]
+            self._cursor += 1
+            if reply == "QUEUED":
+                self.log.append(("recv", self.generation, "QUEUED"))
+                self._fail(3)
+                return b"QUEUED"
+            if reply == "EXEC":
+                self.log.append(("recv", self.generation, "EXEC"))
+                self._fail(4)
+                return [[True]]
+            self.log.append(("recv", self.generation, reply))
+            return reply
+
+        def pack_commands(self, commands):
+            return commands
+
+        def send_packed_command(self, packed, *args, **kwargs):
+            self._ensure()
+            names = tuple(command[0] for command in packed)
+            self.log.append(("send-packed", self.generation, names))
+            self._fail(2)
+            for name in names:
+                if name == "MULTI":
+                    self._replies.append(True)
+                elif name == "EXEC":
+                    self._replies.append("EXEC")
+                else:
+                    self._replies.append("QUEUED")
+
+    class FakePool:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def get_connection(self, *args, **kwargs):
+            return self.connection
+
+        def release(self, connection):
+            pass
+
+    def _build(self, point):
+        log = []
+        connection = self.FakeConnection(Retry(NoBackoff(), 3), point, log)
+        pipeline = Pipeline(self.FakePool(connection), {}, True, None)
+        return connection, pipeline, log
+
+    def _run_cycle(self, pipe):
+        pipe.watch("owner")
+        owner = pipe.get("owner")
+        pipe.multi()
+        pipe.set("record", owner)
+        return pipe.execute()
+
+    def test_point_one_retries_watch_then_completes(self):
+        connection, pipe, log = self._build(1)
+        result = self._run_cycle(pipe)
+        assert result == [[True]]
+        assert connection.generation == 1
+        assert not pipe.watching
+        # WATCH is sent twice (failed gen-0 attempt, then gen-1), but the
+        # condition is only read and the transaction only sent on gen-1.
+        assert [entry for entry in log if entry[0] == "send"] == [
+            ("send", 0, "WATCH"),
+            ("send", 1, "WATCH"),
+            ("send", 1, "GET"),
+        ]
+        packed = [entry for entry in log if entry[0] == "send-packed"]
+        assert packed == [("send-packed", 1, ("MULTI", "SET", "EXEC"))]
+
+    @pytest.mark.parametrize("point", [2, 3, 4])
+    def test_disconnect_after_watch_raises_safe_error(self, point):
+        connection, pipe, log = self._build(point)
+        if point == 2:
+            # MULTI batch never reached the server: a plain WatchError is the
+            # honest "nothing ran, re-WATCH and re-read" signal.
+            with pytest.raises(redis.WatchError):
+                self._run_cycle(pipe)
+        else:
+            # EXEC was already on the wire: the outcome is unknown and must
+            # not be disguised as a WatchError the caller would auto-retry.
+            with pytest.raises(redis.ExecUnknownError):
+                self._run_cycle(pipe)
+        assert not pipe.watching
+        # The queued writes were sent at most once, and never on a
+        # generation whose WATCH had not been established.
+        packed = [entry for entry in log if entry[0] == "send-packed"]
+        assert len(packed) == 1
+        assert packed[0][1] == 0
+        # After the failure the dead socket is replaced rather than reused.
+        assert connection.generation == 1
+
+    def test_exec_unknown_is_not_a_watch_error(self):
+        assert not issubclass(redis.ExecUnknownError, redis.WatchError)

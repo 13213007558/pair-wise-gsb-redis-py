@@ -224,8 +224,23 @@ class TestClusterTransaction:
                     side_effect=fail_after_read,
                 )
 
+            # An EXEC that already left the wire may have committed, so a
+            # connection failure is reported as an unknown outcome rather than
+            # disguised as a re-runnable WatchError. Slot redirects still
+            # surface as WatchError (the moved transaction was not run here).
+            connection_errors = (
+                redis.exceptions.ConnectionError,
+                redis.exceptions.TimeoutError,
+                redis.exceptions.ClusterDownError,
+                redis.exceptions.SlotNotCoveredError,
+            )
+            if command == "EXEC" and isinstance(error, connection_errors):
+                expected_error = redis.exceptions.ExecUnknownError
+            else:
+                expected_error = redis.exceptions.WatchError
+
             with patcher:
-                with pytest.raises(redis.exceptions.WatchError) as exc_info:
+                with pytest.raises(expected_error) as exc_info:
                     if command == "EXEC":
                         await pipe.execute()
                     else:
@@ -240,6 +255,7 @@ class TestClusterTransaction:
             # Reset and reuse must not retain acknowledged WATCH state.
             await pipe.reset()
             assert not strategy._watch_acknowledged
+            assert not strategy._exec_sent
             await pipe.watch(key)
             assert strategy._watch_acknowledged
             await pipe.unwatch()
