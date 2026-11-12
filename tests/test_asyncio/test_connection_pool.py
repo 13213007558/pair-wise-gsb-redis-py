@@ -223,6 +223,11 @@ class TestConnectionPool:
 
             other.send_command.assert_awaited_once_with("AUTH", "oid", "value")
             in_use.set_re_auth_token.assert_called_once_with(token)
+            # The connection that could not re-authenticate is evicted from the
+            # reusable set and disconnected; the healthy one stays available.
+            assert failing not in pool._available_connections
+            failing.disconnect.assert_awaited()
+            assert other in pool._available_connections
 
     @pytest.mark.fixed_client
     async def test_re_auth_stops_at_authentication_error(self):
@@ -243,6 +248,10 @@ class TestConnectionPool:
             failing.read_response.assert_awaited_once()
             other.send_command.assert_not_awaited()
             in_use.set_re_auth_token.assert_not_called()
+            # A rejected credential removes the connection rather than leaving
+            # an unauthenticated session in the reusable set.
+            assert failing not in pool._available_connections
+            failing.disconnect.assert_awaited()
 
     async def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0]}

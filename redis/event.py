@@ -195,12 +195,17 @@ class AfterConnectionReleasedEvent:
     Event that will be fired before each command execution.
     """
 
-    def __init__(self, connection):
+    def __init__(self, connection, pool=None):
         self._connection = connection
+        self._pool = pool
 
     @property
     def connection(self):
         return self._connection
+
+    @property
+    def pool(self):
+        return self._pool
 
 
 class AsyncAfterConnectionReleasedEvent(AfterConnectionReleasedEvent):
@@ -456,7 +461,13 @@ class ReAuthConnectionListener(EventListenerInterface):
     """
 
     def listen(self, event: AfterConnectionReleasedEvent):
-        event.connection.re_auth()
+        # A pooled connection that fails re-auth is evicted by the pool, so it
+        # can never be lent out again under a stale or rejected identity. A
+        # connection without a pool (single-connection client) re-auths alone.
+        if event.pool is not None:
+            event.pool.re_auth_released_connection(event.connection)
+        else:
+            event.connection.re_auth()
 
 
 class AsyncReAuthConnectionListener(AsyncEventListenerInterface):
@@ -465,7 +476,10 @@ class AsyncReAuthConnectionListener(AsyncEventListenerInterface):
     """
 
     async def listen(self, event: AsyncAfterConnectionReleasedEvent):
-        await event.connection.re_auth()
+        if event.pool is not None:
+            await event.pool.re_auth_released_connection(event.connection)
+        else:
+            await event.connection.re_auth()
 
 
 class RegisterReAuthForPooledConnections(EventListenerInterface):

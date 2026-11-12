@@ -1869,13 +1869,18 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
     def re_auth(self):
         if self._re_auth_token is not None:
+            # Consume the pending generation up front: a failed AUTH disconnects
+            # this connection (read_response disconnects on error), and leaving
+            # the token in place would let a later release retry a credential
+            # that was already rejected instead of forcing a fresh handshake.
+            token = self._re_auth_token
+            self._re_auth_token = None
             self.send_command(
                 "AUTH",
-                self._re_auth_token.try_get("oid"),
-                self._re_auth_token.get_value(),
+                token.try_get("oid"),
+                token.get_value(),
             )
             self.read_response()
-            self._re_auth_token = None
 
     def _get_socket(self) -> Optional[socket.socket]:
         return self._sock
@@ -3386,6 +3391,10 @@ class ConnectionPoolInterface(ABC):
         pass
 
     @abstractmethod
+    def re_auth_released_connection(self, connection: ConnectionInterface):
+        pass
+
+    @abstractmethod
     def get_connection_count(self) -> list[tuple[int, dict]]:
         """
         Returns a connection count (both idle and in use).
@@ -4450,7 +4459,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                     connection.disconnect()
                 self._available_connections.append(connection)
                 self._event_dispatcher.dispatch(
-                    AfterConnectionReleasedEvent(connection)
+                    AfterConnectionReleasedEvent(connection, pool=self)
                 )
 
                 # Record state transition: USED -> IDLE
@@ -4535,7 +4544,10 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     def re_auth_callback(self, token: TokenInterface):
         first_error = None
         with self._lock:
-            for conn in self._available_connections:
+            # Snapshot first: a failed AUTH evicts the connection from the
+            # reusable set, so iterating the live list would skip the element
+            # that follows an evicted one.
+            for conn in list(self._available_connections):
                 try:
                     conn.retry.call_with_retry(
                         lambda: conn.send_command(
@@ -4551,14 +4563,50 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                         ),
                     )
                 except AuthenticationError:
+                    self._evict_failed_re_auth_connection(conn)
                     raise
                 except Exception as e:
+                    self._evict_failed_re_auth_connection(conn)
                     if first_error is None:
                         first_error = e
             for conn in self._in_use_connections:
                 conn.set_re_auth_token(token)
         if first_error is not None:
             raise first_error
+
+    def _evict_failed_re_auth_connection(self, connection: ConnectionInterface) -> None:
+        """Remove a connection whose re-authentication failed from the pool.
+
+        A connection that could not prove the new identity must never be lent
+        out again under the old one. It is disconnected, dropped from the idle
+        set (in-use connections are not re-authenticated in place) and its
+        capacity slot is reclaimed.
+        """
+        if connection not in self._available_connections:
+            return
+        self._available_connections.remove(connection)
+        connection.disconnect()
+        if connection.pid == self.pid:
+            self._created_connections -= 1
+            record_connection_count(
+                pool_name=get_pool_name(self),
+                connection_state=ConnectionState.IDLE,
+                counter=-1,
+            )
+
+    def re_auth_released_connection(self, connection: ConnectionInterface) -> None:
+        """Re-authenticate a just-released connection, evicting it on failure.
+
+        The release listener calls this once the connection is back in the idle
+        set. If its pending AUTH cannot complete, the connection must not remain
+        reusable under a stale or rejected identity, so it is evicted before the
+        error propagates.
+        """
+        try:
+            connection.re_auth()
+        except BaseException:
+            self._evict_failed_re_auth_connection(connection)
+            raise
 
     def _get_pool_lock(self):
         return self._lock

@@ -1804,13 +1804,18 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
 
     async def re_auth(self):
         if self._re_auth_token is not None:
+            # Consume the pending generation up front: a failed AUTH leaves the
+            # connection disconnected, and keeping the token would make a later
+            # release retry a rejected credential instead of forcing a fresh
+            # handshake on the next checkout.
+            token = self._re_auth_token
+            self._re_auth_token = None
             await self.send_command(
                 "AUTH",
-                self._re_auth_token.try_get("oid"),
-                self._re_auth_token.get_value(),
+                token.try_get("oid"),
+                token.get_value(),
             )
             await self.read_response()
-            self._re_auth_token = None
 
 
 class Connection(AbstractConnection):
@@ -2297,6 +2302,10 @@ class ConnectionPoolInterface(ABC):
 
     @abstractmethod
     async def re_auth_callback(self, token: TokenInterface) -> None:
+        pass
+
+    @abstractmethod
+    async def re_auth_released_connection(self, connection) -> None:
         pass
 
     @abstractmethod
@@ -3439,7 +3448,7 @@ class ConnectionPool(
         )
 
         await self._event_dispatcher.dispatch_async(
-            AsyncAfterConnectionReleasedEvent(connection)
+            AsyncAfterConnectionReleasedEvent(connection, pool=self)
         )
 
     def _release_in_background(self, connection: AbstractConnection) -> None:
@@ -3521,7 +3530,10 @@ class ConnectionPool(
     async def re_auth_callback(self, token: TokenInterface):
         first_error = None
         async with self._lock:
-            for conn in self._available_connections:
+            # Snapshot first: a failed AUTH evicts the connection from the
+            # reusable set, so iterating the live list would skip the element
+            # that follows an evicted one.
+            for conn in list(self._available_connections):
                 try:
                     await conn.retry.call_with_retry(
                         lambda: conn.send_command(
@@ -3537,14 +3549,53 @@ class ConnectionPool(
                         ),
                     )
                 except AuthenticationError:
+                    await self._evict_failed_re_auth_connection(conn)
                     raise
                 except Exception as e:
+                    await self._evict_failed_re_auth_connection(conn)
                     if first_error is None:
                         first_error = e
             for conn in self._in_use_connections:
                 conn.set_re_auth_token(token)
         if first_error is not None:
             raise first_error
+
+    async def _evict_failed_re_auth_connection(
+        self, connection: "AbstractConnection"
+    ) -> None:
+        """Remove a connection whose re-authentication failed from the pool.
+
+        A connection that could not prove the new identity must never be lent
+        out again under the old one. It is disconnected and dropped from the
+        idle set (in-use connections are not re-authenticated in place). The
+        async pool caps usage via ``_in_use_connections`` rather than a created
+        counter, so no capacity bookkeeping is needed here.
+        """
+        if connection not in self._available_connections:
+            return
+        self._available_connections.remove(connection)
+        await connection.disconnect()
+        await record_connection_count(
+            pool_name=get_pool_name(self),
+            connection_state=ConnectionState.IDLE,
+            counter=-1,
+        )
+
+    async def re_auth_released_connection(
+        self, connection: "AbstractConnection"
+    ) -> None:
+        """Re-authenticate a just-released connection, evicting it on failure.
+
+        The release listener calls this once the connection is back in the idle
+        set. If its pending AUTH cannot complete, the connection must not remain
+        reusable under a stale or rejected identity, so it is evicted before the
+        error propagates.
+        """
+        try:
+            await connection.re_auth()
+        except BaseException:
+            await self._evict_failed_re_auth_connection(connection)
+            raise
 
     async def _mock(self, error: RedisError):
         """

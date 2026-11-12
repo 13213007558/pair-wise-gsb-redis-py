@@ -186,11 +186,14 @@ class TestConnectionPool:
     def test_failed_re_auth_does_not_stop_the_other_connections(self):
         pool = self.get_pool(connection_class=DummyConnection)
         failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        failing.pid = os.getpid()
         failing.send_command.side_effect = redis.ConnectionError("broken")
         other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        other.pid = os.getpid()
         in_use = mock.Mock(spec=Connection)
         pool._available_connections.extend([failing, other])
         pool._in_use_connections.add(in_use)
+        pool._created_connections = 2
         token = mock.Mock()
         token.try_get.return_value = "oid"
         token.get_value.return_value = "value"
@@ -200,13 +203,21 @@ class TestConnectionPool:
 
         other.send_command.assert_called_once_with("AUTH", "oid", "value")
         in_use.set_re_auth_token.assert_called_once_with(token)
+        # The connection that could not re-authenticate is evicted from the
+        # reusable set and disconnected, its capacity slot reclaimed.
+        assert failing not in pool._available_connections
+        failing.disconnect.assert_called_once()
+        assert pool._created_connections == 1
+        assert other in pool._available_connections
 
     @pytest.mark.fixed_client
     def test_re_auth_stops_at_authentication_error(self):
         pool = self.get_pool(connection_class=DummyConnection)
         failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 3))
+        failing.pid = os.getpid()
         failing.read_response.side_effect = redis.AuthenticationError("expired")
         other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        other.pid = os.getpid()
         in_use = mock.Mock(spec=Connection)
         pool._available_connections.extend([failing, other])
         pool._in_use_connections.add(in_use)
@@ -220,6 +231,10 @@ class TestConnectionPool:
         failing.read_response.assert_called_once()
         other.send_command.assert_not_called()
         in_use.set_re_auth_token.assert_not_called()
+        # A rejected credential removes the connection rather than leaving an
+        # unauthenticated session in the reusable set.
+        assert failing not in pool._available_connections
+        failing.disconnect.assert_called_once()
 
     def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}

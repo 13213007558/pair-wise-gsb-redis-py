@@ -5161,7 +5161,12 @@ class _ClusterNodePoolAdapter(ConnectionPoolInterface):
     # The node's connections are shared with regular cluster traffic and its
     # lifecycle is managed by RedisCluster / NodesManager, so the adapter must
     # not reset, disconnect, retry-configure or re-auth them on behalf of a
-    # single PubSub instance.
+    # single PubSub instance. Re-authentication on credential rotation is
+    # handled once at the ClusterNode level (ClusterNode.re_auth_callback),
+    # including the node's free queue: duplicating it here would AUTH a
+    # connection the adapter does not own and could evict it from a queue that
+    # belongs to the node. These stubs are deliberate scope boundaries, not
+    # silently ignored hooks.
 
     def get_protocol(self):
         return self.connection_kwargs.get("protocol", None)
@@ -5179,6 +5184,11 @@ class _ClusterNodePoolAdapter(ConnectionPoolInterface):
         pass
 
     async def re_auth_callback(self, token: TokenInterface) -> None:
+        pass
+
+    async def re_auth_released_connection(self, connection) -> None:
+        # See the scope note above: the node, not this PubSub-scoped adapter,
+        # owns re-authentication and any eviction of its connections.
         pass
 
     def get_connection_count(self) -> List[Tuple[int, dict]]:
